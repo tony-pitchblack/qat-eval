@@ -1,0 +1,33 @@
+name: qat-eval
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - pip
+  - ipykernel
+  - notebook
+  - jupyterlab
+  - ipywidgets
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - pillow
+  - opencv
+  - tqdm
+  - pyyaml
+  - pytorch
+  - torchvision
+  - torchaudio
+  - onnx
+  - onnxruntime
+  - ffmpeg
+  - typing_extensions
+  - setuptools
+  - wheel
+  - pip:
+      - onnxsim
+
