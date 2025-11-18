@@ -18,3 +18,6 @@ RUN micromamba install -n base -y git \
     && micromamba run -n base git clone https://github.com/tony-pitchblack/qat-eval.git /work/qat-eval
 
 WORKDIR /work/qat-eval
+
+RUN echo 'eval "$(micromamba shell hook -s bash)"' >> ~/.bashrc \
+ && echo 'micromamba activate qat-eval' >> ~/.bashrc
