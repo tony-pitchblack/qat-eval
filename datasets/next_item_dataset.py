@@ -3,11 +3,11 @@ from typing import List, Tuple
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
+from datasets.base import BaseDataset
 
 
-class NextItemDataset(Dataset):
+class NextItemDataset(BaseDataset):
     def __init__(self, root_dir: str, dataset: str, split: str, min_len: int = 1):
         name_map = {
             "Dunnhumby": ("Dunnhumby_history.csv", "Dunnhumby_future.csv"),
@@ -36,11 +36,8 @@ class NextItemDataset(Dataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         return self.sequences[index]
 
-
-def collate_fn(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    lengths = torch.tensor([len(x) for x in batch], dtype=torch.long)
-    padded = pad_sequence(batch, batch_first=True, padding_value=0)
-    return padded, lengths
-
-
-
+    @staticmethod
+    def collate_fn(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        lengths = torch.tensor([len(x) for x in batch], dtype=torch.long)
+        padded = pad_sequence(batch, batch_first=True, padding_value=0)
+        return padded, lengths
