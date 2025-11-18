@@ -20,16 +20,18 @@ docker pull --platform=linux/arm64 tonypitchblack/qat-eval:latest # macos
 ```
 
 ## Run Jupyter kernel inside docker
+First time launch:
 ```bash
-# first time:
 docker run -it --name qat-eval \
   -p 8888:8888 \
   -v "$HOME/qat-eval":/workspace \
   -w /workspace \
   qat-eval \
   bash -lc "micromamba run -n qat-eval jupyter lab --ip=0.0.0.0 --no-browser --NotebookApp.token=''"
+```
 
-# second+ time (reuse existing container):
+Reuse existing container:
+```bash
 docker start -ai qat-eval
 ```
 
