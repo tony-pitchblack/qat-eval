@@ -1,5 +1,18 @@
 # Quantization Aware Training: comprehensive evaluation
 
+## Evaluation Results
+
+| Method   | ROCAUC | NDCG@10 | PSNR |
+|----------|--------|---------|------|
+| No QAT   |        |         |      |
+| LSQ      |        |         |      |
+| PACT     |        |         |      |
+| AdaRound |        |         |      |
+| APoT     |        |         |      |
+| QIL      |        |         |      |
+
+*QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
+
 ## Pull latest Docker container
 ```bash
 docker pull tonypitchblack/qat-eval:latest # linux
