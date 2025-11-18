@@ -14,9 +14,14 @@
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
 
 ## Pull latest Docker container
+Linux or MacOS (non M-series):
 ```bash
-docker pull tonypitchblack/qat-eval:latest # linux
-docker pull --platform=linux/arm64 tonypitchblack/qat-eval:latest # macos
+docker pull --platform=linux/amd64 tonypitchblack/qat-eval:latest
+```
+
+MacOS (M-series):
+```bash
+docker pull --platform=linux/arm64 tonypitchblack/qat-eval:latest
 ```
 
 ## Run Jupyter kernel inside docker
