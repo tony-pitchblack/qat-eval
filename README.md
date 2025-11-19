@@ -2,14 +2,13 @@
 
 ## Evaluation Results
 
-| Method   | LSTM      |          | SASRec    |          | ESPCN     |          |
-|----------|-----------|----------|-----------|----------|-----------|----------|
-|          | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   |
-| LSQ      |           |          |           |          |           |          |
-| PACT     |           |          |           |          |           |          |
-| AdaRound |           |          |           |          |           |          |
-| APoT     |           |          |           |          |           |          |
-| QIL      |           |          |           |          |           |          |
+| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
+|----------|---------------|------------------|--------------|
+| LSQ      |               |                  |              |
+| PACT     |               |                  |              |
+| AdaRound |               |                  |              |
+| APoT     |               |                  |              |
+| QIL      |               |                  |              |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
 
