@@ -2,8 +2,22 @@
 
 ## Evaluation Results
 
+Table 1. 4-bit quantization metrics for different QAT methods, absolute values
+
 | Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
 |----------|---------------|------------------|--------------|
+| No quant      |               |                  |              |
+| LSQ      |               |                  |              |
+| PACT     |               |                  |              |
+| AdaRound |               |                  |              |
+| APoT     |               |                  |              |
+| QIL      |               |                  |              |
+
+Table 2. 4-bit quantization metrics for different QAT methods, values in % relative to no quantization
+
+| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
+|----------|---------------|------------------|--------------|
+| No quant      |               |                  |              |
 | LSQ      |               |                  |              |
 | PACT     |               |                  |              |
 | AdaRound |               |                  |              |
@@ -11,6 +25,7 @@
 | QIL      |               |                  |              |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
+*No quant = No quantization applied*
 
 ## Pull latest Docker container
 Linux or MacOS (non M-series):
