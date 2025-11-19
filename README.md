@@ -24,34 +24,21 @@ MacOS (M-series):
 docker pull --platform=linux/arm64 tonypitchblack/qat-eval:latest
 ```
 
-## Run Jupyter kernel & MLflow inside Docker
-To use Jupyter or MLflow make sure to use `.env` file with:
+## Run Docker container
+The container automatically starts Jupyter and MLflow servers in dedicated tmux sessions.
+Make sure to pass free ports `JUPYTER_PORT` and `MLFLOW_PORT` as env vars (or put them in .env).
+
+To start new container run:
 ```bash
-JUPYTER_PORT=8888 # choose a free port
-MLFLOW_PORT=5000 # choose a free port
+docker run -it --rm --env-file .env --name qat-eval tonypitchblack/qat-eval:latest
 ```
 
-First time launch (Jupyter + MLflow):
-```bash
-source .env
-docker run -it --name qat-eval \
-  --env-file .env \
-  -p $JUPYTER_PORT:$JUPYTER_PORT \
-  -p $MLFLOW_PORT:$MLFLOW_PORT \
-  -v "$HOME/qat-eval":/workspace \
-  -w /workspace \
-  tonypitchblack/qat-eval:latest \
-  bash -lc "
-    micromamba run -n qat-eval jupyter lab --ip=0.0.0.0 --no-browser --NotebookApp.token='' --port=\$JUPYTER_PORT &
-    micromamba run -n qat-eval mlflow ui --host 0.0.0.0 --port \$MLFLOW_PORT &
-    wait
-  "
-```
-
-Reuse existing container:
+To reuse existing container run:
 ```bash
 docker start -ai qat-eval
 ```
+
+To open repo inside the container in VS Code / Cursor IDE use `Dev Containers: Attach to Running Container` and open `/work/qat-eval` folder.
 
 ## Docker build (linux + macos)
 ```bash

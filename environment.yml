@@ -29,3 +29,5 @@ dependencies:
   - setuptools
   - wheel
   - mlflow
+  - git
+  - tmux
