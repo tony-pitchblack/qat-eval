@@ -4,25 +4,25 @@
 
 Table 1. 4-bit quantization metrics for different QAT methods, absolute values
 
-| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
-|----------|---------------|------------------|--------------|
-| No quant      |               |                  |              |
-| LSQ      |               |                  |              |
-| PACT     |               |                  |              |
-| AdaRound |               |                  |              |
-| APoT     |               |                  |              |
-| QIL      |               |                  |              |
+| Method    |   LSTM (ROCAUC)   | SASRec (NDCG@10) | ESPCN (PSNR)  |
+|-----------|:-----------------:|:----------------:|:-------------:|
+| No quant  |                   |                  |               |
+| LSQ       |                   |                  |               |
+| PACT      |                   |                  |               |
+| AdaRound  |                   |                  |               |
+| APoT      |                   |                  |               |
+| QIL       |                   |                  |               |
 
 Table 2. 4-bit quantization metrics for different QAT methods, values in % relative to no quantization
 
-| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
-|----------|---------------|------------------|--------------|
-| No quant      |               |                  |              |
-| LSQ      |               |                  |              |
-| PACT     |               |                  |              |
-| AdaRound |               |                  |              |
-| APoT     |               |                  |              |
-| QIL      |               |                  |              |
+| Method    |   LSTM (ROCAUC)   | SASRec (NDCG@10) | ESPCN (PSNR)  |
+|-----------|:-----------------:|:----------------:|:-------------:|
+| No quant  |                   |                  |               |
+| LSQ       |                   |                  |               |
+| PACT      |                   |                  |               |
+| AdaRound  |                   |                  |               |
+| APoT      |                   |                  |               |
+| QIL       |                   |                  |               |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
 *No quant = No quantization applied*
@@ -83,12 +83,9 @@ python main.py --model lstm        --quantizer lsq --quantizer-config default --
 
 - **With bit-width gridsearch quantizer config** (e.g. LSQ over bit_width \([2, 4, 8, 16]\)):
 ```bash
-python main.py --model sasrec      --quantizer lsq  --quantizer-config bit_width_gridsearch \ --logging-backend mlflow
-
+python main.py --model sasrec      --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
 python main.py --model simple_cnn  --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
-
 python main.py --model espcn       --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
-
 python main.py --model lstm        --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
 ```
 
