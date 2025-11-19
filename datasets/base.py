@@ -6,6 +6,17 @@ from torch.utils.data import Dataset
 
 
 class BaseDataset(Dataset, ABC):
+    @property
+    def inferred_params(self) -> Any:
+        if not hasattr(self, "_inferred_params"):
+            from types import SimpleNamespace
+            self._inferred_params = SimpleNamespace()
+        return self._inferred_params
+
+    @inferred_params.setter
+    def inferred_params(self, value: Any) -> None:
+        self._inferred_params = value
+
     @abstractmethod
     def __len__(self) -> int:
         ...

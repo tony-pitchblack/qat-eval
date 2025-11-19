@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from datasets.base import BaseDataset
+from types import SimpleNamespace
 
 
 class NextItemDataset(BaseDataset):
@@ -32,6 +33,18 @@ class NextItemDataset(BaseDataset):
             torch.tensor(seq, dtype=torch.long) for seq in grouped.tolist() if len(seq) >= min_len
         ]
 
+        # Infer vocabulary size (num_items) from BOTH train and val files
+        train_file, val_file = name_map[dataset]
+        train_path = os.path.join(base_root, train_file)
+        val_path = os.path.join(base_root, val_file)
+        df_train = pd.read_csv(train_path, dtype=dtypes)
+        df_val = pd.read_csv(val_path, dtype=dtypes)
+        # Assumes item ids are positive integers; use max id across splits as num_items
+        max_train = int(df_train["MATERIAL_NUMBER"].max()) if not df_train.empty else 0
+        max_val = int(df_val["MATERIAL_NUMBER"].max()) if not df_val.empty else 0
+        self.num_items: int = max(max_train, max_val)
+        self.inferred_params = SimpleNamespace(num_items=self.num_items)
+
     def __len__(self) -> int:
         return len(self.sequences)
 
@@ -39,7 +52,11 @@ class NextItemDataset(BaseDataset):
         return self.sequences[index]
 
     @staticmethod
-    def collate_fn(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def collate_fn(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         lengths = torch.tensor([len(x) for x in batch], dtype=torch.long)
         padded = pad_sequence(batch, batch_first=True, padding_value=0)
-        return padded, lengths
+        inputs = padded[:, :-1]
+        input_lengths = torch.clamp(lengths - 1, min=1)
+        batch_idx = torch.arange(padded.size(0), device=padded.device)
+        targets = padded[batch_idx, lengths - 1]
+        return inputs, input_lengths, targets
