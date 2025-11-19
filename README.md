@@ -49,24 +49,33 @@ python main.py \
   [--logging-backend none|mlflow]
 ```
 
-Basic usage (automatically use default configs):
+Example one-liners to launch training for all models with MLflow logging:
+
+- **Without quantization** (no_quant baseline for each model):
 ```bash
-python main.py --model sasrec --quantizer no_quant
+python main.py --model sasrec      --quantizer no_quant --logging-backend mlflow
+python main.py --model simple_cnn  --quantizer no_quant --logging-backend mlflow
+python main.py --model espcn       --quantizer no_quant --logging-backend mlflow
+python main.py --model lstm        --quantizer no_quant --logging-backend mlflow
 ```
 
-To run with custom configs:
+- **With default quantizer config** (per-model defaults):
 ```bash
-python main.py \
-  --model sasrec \
-  --quantizer no_quant \
-  --device cpu \
-  --model-config configs/sasrec_custom.yaml \
-  --quantizer-config configs/no_quant_custom.yaml
+python main.py --model sasrec      --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model simple_cnn  --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model espcn       --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model lstm        --quantizer lsq --quantizer-config default --logging-backend mlflow
 ```
 
-To use MLflow logging see section "Advanced Docker container usage with Jupyter & MLflow" and then enable it via `--logging-backend mlflow` option:
+- **With bit-width gridsearch quantizer config** (e.g. LSQ over bit_width \([2, 4, 8, 16]\)):
 ```bash
-python main.py --model sasrec --quantizer no_quant --logging-backend mlflow
+python main.py --model sasrec      --quantizer lsq  --quantizer-config bit_width_gridsearch \ --logging-backend mlflow
+
+python main.py --model simple_cnn  --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
+
+python main.py --model espcn       --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
+
+python main.py --model lstm        --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
 ```
 
 ## Advanced Docker container usage with Jupyter & MLflow
