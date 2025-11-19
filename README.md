@@ -2,16 +2,30 @@
 
 ## Evaluation Results
 
-| Method   | ROCAUC | NDCG@10 | PSNR |
-|----------|--------|---------|------|
-| No QAT   |        |         |      |
-| LSQ      |        |         |      |
-| PACT     |        |         |      |
-| AdaRound |        |         |      |
-| APoT     |        |         |      |
-| QIL      |        |         |      |
+Table 1. 4-bit quantization metrics for different QAT methods, absolute values
+
+| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
+|----------|---------------|------------------|--------------|
+| No quant      |               |                  |              |
+| LSQ      |               |                  |              |
+| PACT     |               |                  |              |
+| AdaRound |               |                  |              |
+| APoT     |               |                  |              |
+| QIL      |               |                  |              |
+
+Table 2. 4-bit quantization metrics for different QAT methods, values in % relative to no quantization
+
+| Method   | LSTM (ROCAUC) | SASRec (NDCG@10) | ESPCN (PSNR) |
+|----------|---------------|------------------|--------------|
+| No quant      |               |                  |              |
+| LSQ      |               |                  |              |
+| PACT     |               |                  |              |
+| AdaRound |               |                  |              |
+| APoT     |               |                  |              |
+| QIL      |               |                  |              |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
+*No quant = No quantization applied*
 
 ## Pull latest Docker container
 Linux or MacOS (non M-series):
@@ -37,6 +51,47 @@ docker start -ai qat-eval
 
 To open repo inside the container in VS Code / Cursor IDE use `Dev Containers: Attach to Running Container` and open `/work/qat-eval` folder.
 
+## Run training
+From inside the container (or a local environment with dependencies installed), you can launch training with `main.py`:
+```bash
+python main.py \
+  --model {sasrec,espcn,lstm,simple_cnn} \
+  --quantizer {no_quant,lsq,pact,adaround,apot,qil} \
+  [--model-config PATH] \
+  [--quantizer-config PATH] \
+  [--device cpu|cuda|mps] \
+  [--logging-backend none|mlflow]
+```
+
+Example one-liners to launch training for all models with MLflow logging:
+
+- **Without quantization** (no_quant baseline for each model):
+```bash
+python main.py --model sasrec      --quantizer no_quant --logging-backend mlflow
+python main.py --model simple_cnn  --quantizer no_quant --logging-backend mlflow
+python main.py --model espcn       --quantizer no_quant --logging-backend mlflow
+python main.py --model lstm        --quantizer no_quant --logging-backend mlflow
+```
+
+- **With default quantizer config** (per-model defaults):
+```bash
+python main.py --model sasrec      --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model simple_cnn  --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model espcn       --quantizer lsq --quantizer-config default --logging-backend mlflow
+python main.py --model lstm        --quantizer lsq --quantizer-config default --logging-backend mlflow
+```
+
+- **With bit-width gridsearch quantizer config** (e.g. LSQ over bit_width \([2, 4, 8, 16]\)):
+```bash
+python main.py --model sasrec      --quantizer lsq  --quantizer-config bit_width_gridsearch \ --logging-backend mlflow
+
+python main.py --model simple_cnn  --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
+
+python main.py --model espcn       --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
+
+python main.py --model lstm        --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
+```
+
 ## Advanced Docker container usage with Jupyter & MLflow
 To start Jupyter and MLflow servers in dedicated tmux sessions inside the container, first set up hosts/ports in `.env` file:
 ```bash
@@ -56,16 +111,22 @@ source .env && docker run -it --rm \
   tonypitchblack/qat-eval:latest
 ```
 
-Then start Jupyter and MLflow in separate tmux sessions:
+To start Jupyter in tmux session run:
 ```bash
-micromamba run -n qat-eval tmux new -s jupyter -d \
+micromamba activate qat-eval && \
+tmux new -s jupyter -d \
   "jupyter notebook \
   --ip=$JUPYTER_HOST \
   --port=$JUPYTER_PORT \
   --no-browser \
   --allow-root \
   --NotebookApp.token="
-micromamba run -n qat-eval tmux new -s mlflow -d \
+```
+
+To start MLflow in tmux session run:
+```bash
+micromamba activate qat-eval && \
+tmux new -s mlflow -d \
   "mlflow server \
   --host ${MLFLOW_HOST} \
   --port ${MLFLOW_PORT}"
