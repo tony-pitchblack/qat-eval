@@ -1,8 +1,8 @@
 model:
   max_seq_len: 10
   hidden_size: 64
-  num_heads: 2
-  num_layers: 2
+  num_heads: 1
+  num_layers: 1
   dropout: 0.1
   pad_token_id: 0
 
@@ -13,7 +13,7 @@ dataset:
 
 training:
   batch_size: 128
-  epochs: 1
+  epochs: 5
   lr: 0.001
   weight_decay: 0.0
 
