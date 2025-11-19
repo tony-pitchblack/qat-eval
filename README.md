@@ -2,14 +2,15 @@
 
 ## Evaluation Results
 
-| Method   | ROCAUC | NDCG@10 | PSNR |
-|----------|--------|---------|------|
-| No QAT   |        |         |      |
-| LSQ      |        |         |      |
-| PACT     |        |         |      |
-| AdaRound |        |         |      |
-| APoT     |        |         |      |
-| QIL      |        |         |      |
+| Method   | LSTM      |          | SASRec    |          | ESPCN     |          |
+|----------|-----------|----------|-----------|----------|-----------|----------|
+|          | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   |
+| No QAT   |           |          |           |          |           |          |
+| LSQ      |           |          |           |          |           |          |
+| PACT     |           |          |           |          |           |          |
+| AdaRound |           |          |           |          |           |          |
+| APoT     |           |          |           |          |           |          |
+| QIL      |           |          |           |          |           |          |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
 
