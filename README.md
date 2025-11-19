@@ -42,7 +42,7 @@ From inside the container (or a local environment with dependencies installed), 
 ```bash
 python main.py \
   --model {sasrec,espcn,lstm} \
-  --quantizer {base,dummy,lsq,pact,adaround,apot,qil} \
+  --quantizer {dummy,lsq,pact,adaround,apot,qil} \
   [--model-config PATH] \
   [--quantizer-config PATH] \
   [--device cpu|cuda|mps] \
