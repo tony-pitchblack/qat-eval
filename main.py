@@ -82,6 +82,30 @@ def resolve_default_quantizer_config_path(quantizer: str) -> str:
     return os.path.join("configs", "quantizer_configs", f"{quantizer}_default.yml")
 
 
+def _load_env_file(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def get_mlflow_tracking_uri(env_path: str = ".env") -> str:
+    _load_env_file(env_path)
+    host = os.environ.get("MLFLOW_HOST")
+    port = os.environ.get("MLFLOW_PORT")
+    if not host or not port:
+        raise ValueError("MLFLOW_HOST and MLFLOW_PORT must be set in the .env file or environment")
+    return f"http://{host}:{port}"
+
+
 def fit_sasrec(
     model: SASRecModel,
     quantizer_module: torch.nn.Module,
@@ -90,10 +114,14 @@ def fit_sasrec(
     train_cfg: Dict[str, Any],
     metric_fn,
     device: torch.device,
+    logging_backend: str = "none",
+    mlflow_client=None,
 ) -> None:
     lr = float(train_cfg.get("lr", 1e-3))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
     epochs = int(train_cfg.get("epochs", 1))
+
+    use_mlflow = logging_backend == "mlflow" and mlflow_client is not None
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
@@ -144,6 +172,12 @@ def fit_sasrec(
 
         train_loss_avg = (train_loss_sum / max(1, train_count)) if train_count > 0 else 0.0
         train_metric_avg = (train_metric_sum / max(1, len(train_loader))) if len(train_loader) > 0 else 0.0
+        if use_mlflow:
+            mlflow_client.log_metric("train_loss", train_loss_avg, step=epoch + 1)
+            mlflow_client.log_metric("train_metric", train_metric_avg, step=epoch + 1)
+            mlflow_client.log_metric("val_loss", val_loss_avg, step=epoch + 1)
+            mlflow_client.log_metric("val_metric", val_metric_avg, step=epoch + 1)
+
         print(
             f"\nEpoch {epoch+1}/{epochs}\n"
             f"  Train\n"
@@ -166,6 +200,12 @@ def main():
     parser.add_argument("--model-config", dest="model_config", default=None)
     parser.add_argument("--quantizer-config", dest="quantizer_config", default=None)
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default=None)
+    parser.add_argument(
+        "--logging-backend",
+        dest="logging_backend",
+        choices=["none", "mlflow"],
+        default="none",
+    )
     args = parser.parse_args()
 
     model_cfg_path = args.model_config or resolve_default_model_config_path(args.model)
@@ -224,11 +264,55 @@ def main():
         raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
     quantizer_obj = quantizer_cls(**quantizer_cfg)
 
+    mlflow_client = None
+    if args.logging_backend == "mlflow":
+        mlflow_tracking_uri = get_mlflow_tracking_uri()
+        import mlflow  # type: ignore[import]
+
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
+        mlflow_client = mlflow
+
     if args.model == "sasrec":
         if args.model not in model_name_to_metric_fn:
             raise ValueError(f"No metric mapping found for model '{args.model}'")
         metric_fn = model_name_to_metric_fn[args.model](train_cfg)
-        fit_sasrec(model_obj, quantizer_obj, train_loader, val_loader, train_cfg, metric_fn, device)
+        if mlflow_client is not None:
+            with mlflow_client.start_run(run_name=f"{args.model}_{args.quantizer}"):
+                all_params: Dict[str, Any] = {
+                    "model_name": args.model,
+                    "quantizer_name": args.quantizer,
+                    "batch_size": int(train_cfg.get("batch_size", 0)),
+                }
+                for section_name, section_cfg in [
+                    ("model", model_cfg),
+                    ("dataset", dataset_cfg),
+                    ("training", train_cfg),
+                    ("quantizer", quantizer_cfg),
+                ]:
+                    for k, v in section_cfg.items():
+                        all_params[f"{section_name}.{k}"] = v
+                mlflow_client.log_params(all_params)
+                fit_sasrec(
+                    model_obj,
+                    quantizer_obj,
+                    train_loader,
+                    val_loader,
+                    train_cfg,
+                    metric_fn,
+                    device,
+                    logging_backend="mlflow",
+                    mlflow_client=mlflow_client,
+                )
+        else:
+            fit_sasrec(
+                model_obj,
+                quantizer_obj,
+                train_loader,
+                val_loader,
+                train_cfg,
+                metric_fn,
+                device,
+            )
     else:
         raise NotImplementedError
 
