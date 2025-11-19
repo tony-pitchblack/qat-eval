@@ -29,6 +29,8 @@ from datasets.dummy_lstm_dataset import DummyLSTMDataset
 from models.espcn import ESPCNModel
 from datasets.dummy_espcn_dataset import DummyESPCNDataset
 
+from quantizers._base import BaseQuantizerWrapper
+
 # Uncomment models & datasets as they get implemented
 model_name_to_model_dataset_class = {
     "sasrec": {
@@ -124,6 +126,53 @@ def get_mlflow_tracking_uri(env_path: str = ".env") -> str:
     if not host or not port:
         raise ValueError("MLFLOW_HOST and MLFLOW_PORT must be set in the .env file or environment")
     return f"http://{host}:{port}"
+
+
+def _finalize_model_size(
+    model: torch.nn.Module,
+    quantizer_module: torch.nn.Module,
+    mlflow_client=None,
+) -> torch.nn.Module:
+    if isinstance(quantizer_module, BaseQuantizerWrapper):
+        quantized_model, size_before, size_after = quantizer_module.convert_model(model)
+        if mlflow_client is not None:
+            size_before = int(size_before)
+            size_after = int(size_after)
+            delta_pct = 0.0
+            if size_before > 0:
+                delta_pct = 100.0 * (size_before - size_after) / float(size_before)
+            mlflow_client.log_metric("prequant_model_size", size_before)
+            mlflow_client.log_metric("postquant_model_size", size_after)
+            mlflow_client.log_metric("delta_model_size", float(delta_pct))
+        else:
+            size_before = int(size_before)
+            size_after = int(size_after)
+            delta_pct = 0.0
+            if size_before > 0:
+                delta_pct = 100.0 * (size_before - size_after) / float(size_before)
+            print(
+                f"Model size (bytes) before/after quantization: {size_before} -> {size_after} "
+                f"(delta: {delta_pct:.2f}%)"
+            )
+        return quantized_model
+    size_before = 0
+    for param in model.parameters():
+        if param is None:
+            continue
+        size_before += param.numel() * param.element_size()
+    size_before = int(size_before)
+    size_after = size_before
+    delta_pct = 0.0
+    if mlflow_client is not None:
+        mlflow_client.log_metric("prequant_model_size", size_before)
+        mlflow_client.log_metric("postquant_model_size", size_after)
+        mlflow_client.log_metric("delta_model_size", float(delta_pct))
+    else:
+        print(
+            f"Model size (bytes) before/after quantization: {size_before} -> {size_after} "
+            f"(delta: {delta_pct:.2f}%)"
+        )
+    return model
 
 
 def fit_sasrec(
@@ -443,6 +492,7 @@ def main():
                     logging_backend="mlflow",
                     mlflow_client=mlflow_client,
                 )
+                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
         else:
             fit_sasrec(
                 model_obj,
@@ -454,6 +504,7 @@ def main():
                 metric_name,
                 device,
             )
+            model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
         metric_name = "accuracy"
         metric_fn = accuracy
@@ -496,6 +547,7 @@ def main():
                     logging_backend="mlflow",
                     mlflow_client=mlflow_client,
                 )
+                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
         else:
             fit_simple_cnn(
                 model_obj,
@@ -507,6 +559,7 @@ def main():
                 metric_name,
                 device,
             )
+            model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
 
 
 if __name__ == "__main__":
