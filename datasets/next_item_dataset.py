@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import pandas as pd
 import torch
@@ -8,7 +8,7 @@ from datasets.base import BaseDataset
 
 
 class NextItemDataset(BaseDataset):
-    def __init__(self, root_dir: str, dataset: str, split: str, min_len: int = 1):
+    def __init__(self, root_dir: Optional[str], dataset: str, split: str, min_len: int = 1):
         name_map = {
             "Dunnhumby": ("Dunnhumby_history.csv", "Dunnhumby_future.csv"),
             "Instacart": ("Instacart_history.csv", "Instacart_future.csv"),
@@ -20,7 +20,9 @@ class NextItemDataset(BaseDataset):
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
         filename = name_map[dataset][0 if split == "train" else 1]
-        path = os.path.join(root_dir, filename)
+        default_root = os.path.join("external_repos", "TIFUKNN", "data")
+        base_root = root_dir or default_root
+        path = os.path.join(base_root, filename)
 
         dtypes = {"CUSTOMER_ID": "int64", "ORDER_NUMBER": "int64", "MATERIAL_NUMBER": "int64"}
         df = pd.read_csv(path, dtype=dtypes)
