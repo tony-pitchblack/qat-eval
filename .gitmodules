@@ -1,3 +1,6 @@
 [submodule "TIFUKNN"]
 	path = external_repos/TIFUKNN
 	url = https://github.com/HaojiHu/TIFUKNN.git
+[submodule "external_repos/TIFUKNN"]
+	path = external_repos/TIFUKNN
+	url = https://github.com/HaojiHu/TIFUKNN.git
