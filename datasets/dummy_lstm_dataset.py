@@ -2,7 +2,7 @@
 
 from typing import Any, List
 
-from datasets.base import BaseDataset
+from datasets._base import BaseDataset
 
 
 class DummyLSTMDataset(BaseDataset):

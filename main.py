@@ -212,7 +212,7 @@ def main():
     parser.add_argument(
         "--quantizer",
         required=True,
-        choices=["base", "dummy", "lsq", "pact", "adaround", "apot", "qil"],
+        choices=["dummy", "lsq", "pact", "adaround", "apot", "qil"],
     )
     parser.add_argument("--model-config", dest="model_config", default=None)
     parser.add_argument("--quantizer-config", dest="quantizer_config", default=None)

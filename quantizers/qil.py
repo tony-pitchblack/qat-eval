@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 import torch
 
-from .base import BaseQuantizer
+from ._base import BaseQuantizer
 
 
 class QILQuantizer(BaseQuantizer):

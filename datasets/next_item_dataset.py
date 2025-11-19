@@ -4,7 +4,7 @@ from typing import List, Tuple, Optional
 import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from datasets.base import BaseDataset
+from datasets._base import BaseDataset
 from types import SimpleNamespace
 
 
