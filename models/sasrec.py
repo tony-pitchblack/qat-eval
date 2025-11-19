@@ -8,7 +8,7 @@ def _generate_subsequent_mask(seq_len: int, device: Union[str, torch.device]) ->
     return mask
 
 
-class SASRec(nn.Module):
+class SASRecModel(nn.Module):
     def __init__(
         self,
             num_items: int,

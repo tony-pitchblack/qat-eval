@@ -1,26 +1,66 @@
 #!/usr/bin/env python3
+
+# Basic imports
 import argparse
-import os
 from typing import Any, Dict, Tuple
-
-ENABLE_MPS_FALLBACK = os.environ.get("ENABLE_MPS_FALLBACK")
-if ENABLE_MPS_FALLBACK is not None:
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1" if ENABLE_MPS_FALLBACK.lower() in {"1", "true", "yes", "y"} else "0"
-
 import torch
 import yaml
 from torch.utils.data import DataLoader
+import os
+from tqdm.auto import tqdm
 
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+# Import models & datasets
+from models.sasrec import SASRecModel
 from datasets.next_item_dataset import NextItemDataset
-from models.sasrec import SASRec
+from metrics import ndcg_at_k
 
-# Quantizers
+from models.lstm import LSTMModel
+from datasets.dummy_lstm_dataset import DummyLSTMDataset
+
+from models.espcn import ESPCNModel
+from datasets.dummy_espcn_dataset import DummyESPCNDataset
+
+# Uncomment models & datasets as they get implemented
+model_name_to_model_dataset_class = {
+    "sasrec": {
+        "model_class": SASRecModel,
+        "dataset_class": NextItemDataset
+    },
+    # "lstm": {
+    #     "model_class": LSTMModel,
+    #     "dataset_class": DummyLSTMDataset
+    # },
+    # "espcn": {
+    #     "model_class": ESPCNModel,
+    #     "dataset_class": DummyESPCNDataset
+    # },
+}
+
+# Import quantizers
 from quantizers.dummy import DummyQuantizer
-try:
-    from quantizers.lsq import LSQQuantizer
-except Exception:
-    LSQQuantizer = None  # optional
+from quantizers.lsq import LSQQuantizer
+from quantizers.pact import PACTQuantizer
+from quantizers.adaround import AdaRoundQuantizer
+from quantizers.apot import APoTQuantizer
+from quantizers.qil import QILQuantizer
 
+# Uncomment quantizers as they get implemented
+quantizer_name_to_quantizer_class = {
+    "dummy": DummyQuantizer,
+    "lsq": LSQQuantizer,
+    # "pact": PACTQuantizer,
+    # "adaround": AdaRoundQuantizer,
+    # "apot": APoTQuantizer,
+    # "qil": QILQuantizer,
+}
+
+model_name_to_metric_fn = {
+    "sasrec": lambda train_cfg: (lambda preds, targets: ndcg_at_k(preds, targets, k=int(train_cfg.get("metric_k", 10)))),
+    # "lstm": lambda train_cfg: rocauc(...),  # to be defined when LSTM is enabled
+    # "espcn": lambda train_cfg: psnr(...),    # to be defined when ESPCN is enabled
+}
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
     if not path or not os.path.isfile(path):
@@ -40,41 +80,6 @@ def resolve_default_quantizer_config_path(quantizer: str) -> str:
     return os.path.join("configs", "quantizer_configs", f"{quantizer}_default.yml")
 
 
-def build_quantizer(quantizer: str, q_cfg: Dict[str, Any]):
-    bit_width = int(q_cfg.get("bit_width", 32))
-    per_channel = bool(q_cfg.get("per_channel", False))
-    if quantizer == "dummy":
-        return DummyQuantizer(bit_width=bit_width, per_channel=per_channel)
-    if quantizer == "lsq":
-        if LSQQuantizer is None:
-            raise RuntimeError("LSQQuantizer unavailable")
-        return LSQQuantizer(bit_width=bit_width, per_channel=per_channel)
-    if quantizer == "base":
-        return DummyQuantizer(bit_width=32, per_channel=False)
-    raise NotImplementedError(f"Quantizer '{quantizer}' not implemented")
-
-
-def split_inputs_targets(padded: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    inputs = padded[:, :-1]
-    last_index = torch.clamp(lengths - 1, min=0)
-    batch_idx = torch.arange(padded.size(0), device=padded.device)
-    targets = padded[batch_idx, last_index]
-    return inputs, targets
-
-
-def resolve_default_quantizer_config_path(quantizer: str) -> str:
-    base_dir = os.path.join("configs", "quantizer_configs")
-    candidates = [
-        f"{quantizer}_default.yml",
-        f"{quantizer}_quantizer_default.yml",
-    ]
-    for name in candidates:
-        path = os.path.join(base_dir, name)
-        if os.path.isfile(path):
-            return path
-    return os.path.join(base_dir, candidates[-1])
-
-
 def select_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -85,11 +90,12 @@ def select_device() -> torch.device:
 
 
 def fit_sasrec(
-    model: SASRec,
+    model: SASRecModel,
     quantizer_module: torch.nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
     train_cfg: Dict[str, Any],
+    metric_fn,
     device: torch.device,
 ) -> None:
     lr = float(train_cfg.get("lr", 1e-3))
@@ -101,27 +107,59 @@ def fit_sasrec(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = torch.nn.CrossEntropyLoss()
 
-    model.train()
-    for _ in range(epochs):
-        for padded, lengths in train_loader:
-            padded = padded.to(device)
-            lengths = lengths.to(device)
-            inputs, targets = split_inputs_targets(padded, lengths)
-            logits = model(inputs, torch.clamp(lengths - 1, min=1))
+    for epoch in range(epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_metric_sum = 0.0
+        train_count = 0
+        for inputs, input_lengths, targets in tqdm(train_loader, desc=f"Train {epoch+1}/{epochs}"):
+            inputs = inputs.to(device)
+            input_lengths = input_lengths.to(device)
+            targets = targets.to(device)
+            logits = model(inputs, input_lengths)
             logits = quantizer_module(logits)
             loss = criterion(logits, targets)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            batch_size = targets.size(0)
+            train_loss_sum += loss.item() * batch_size
+            train_metric_sum += metric_fn(logits.detach(), targets)
+            train_count += batch_size
+
+        val_loss_avg = 0.0
+        val_metric_avg = 0.0
         if val_loader is not None:
             model.eval()
+            val_loss_sum = 0.0
+            val_metric_sum = 0.0
+            val_count = 0
             with torch.no_grad():
-                for padded, lengths in val_loader:
-                    padded = padded.to(device)
-                    lengths = lengths.to(device)
-                    inputs, targets = split_inputs_targets(padded, lengths)
-                    _ = model(inputs, torch.clamp(lengths - 1, min=1))
-            model.train()
+                for inputs, input_lengths, targets in tqdm(val_loader, desc=f"Valid {epoch+1}/{epochs}"):
+                    inputs = inputs.to(device)
+                    input_lengths = input_lengths.to(device)
+                    targets = targets.to(device)
+                    logits = model(inputs, input_lengths)
+                    logits = quantizer_module(logits)
+                    loss = criterion(logits, targets)
+                    batch_size = targets.size(0)
+                    val_loss_sum += loss.item() * batch_size
+                    val_metric_sum += metric_fn(logits, targets)
+                    val_count += batch_size
+            val_loss_avg = (val_loss_sum / max(1, val_count)) if val_count > 0 else 0.0
+            val_metric_avg = (val_metric_sum / max(1, len(val_loader))) if len(val_loader) > 0 else 0.0
+
+        train_loss_avg = (train_loss_sum / max(1, train_count)) if train_count > 0 else 0.0
+        train_metric_avg = (train_metric_sum / max(1, len(train_loader))) if len(train_loader) > 0 else 0.0
+        print(
+            f"\nEpoch {epoch+1}/{epochs}\n"
+            f"  Train\n"
+            f"    Loss  : {train_loss_avg:.4f}\n"
+            f"    Metric: {train_metric_avg:.4f}\n"
+            f"  Val\n"
+            f"    Loss  : {val_loss_avg:.4f}\n"
+            f"    Metric: {val_metric_avg:.4f}"
+        )
 
 
 def main():
@@ -148,27 +186,44 @@ def main():
 
     device = select_device()
 
+    mapping = model_name_to_model_dataset_class.get(args.model)
+    if mapping is None:
+        raise NotImplementedError(f"Model '{args.model}' not implemented")
+    model_cls = mapping["model_class"]
+    dataset_cls = mapping["dataset_class"]
+
+    train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
+    val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
+
+    batch_size = int(train_cfg["batch_size"])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=dataset_cls.collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=dataset_cls.collate_fn)
+
+    inferred = getattr(train_ds, "inferred_params", None)
+    if inferred is None:
+        raise ValueError("Dataset does not expose inferred_params needed for model construction")
+    if isinstance(inferred, dict):
+        inferred_dict = inferred
+    else:
+        inferred_dict = getattr(inferred, "__dict__", {}) or {}
+    num_items = int(inferred_dict.get("num_items", 0))
+    if num_items <= 0:
+        raise ValueError("Failed to infer a positive num_items from inferred_params")
+    inferred_dict = {**inferred_dict, "num_items": num_items}
+    model_obj = model_cls(**{**model_cfg, **inferred_dict})
+
+    quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
+    if quantizer_cls is None:
+        raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
+    quantizer_obj = quantizer_cls(**quantizer_cfg)
+
     if args.model == "sasrec":
-        root_dir = dataset_cfg.get("root_dir", os.path.join("external_repos", "TIFUKNN", "data"))
-        dataset_name = dataset_cfg.get("dataset", "Dunnhumby")
-        min_len = int(dataset_cfg.get("min_len", 2))
-
-        train_ds = NextItemDataset(root_dir=root_dir, dataset=dataset_name, split="train", min_len=min_len)
-        val_ds = NextItemDataset(root_dir=root_dir, dataset=dataset_name, split="val", min_len=min_len)
-
-        batch_size = int(train_cfg.get("batch_size", 64))
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=NextItemDataset.collate_fn)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=NextItemDataset.collate_fn)
-
-        if "num_items" not in model_cfg or int(model_cfg["num_items"]) <= 0:
-            raise ValueError("model.num_items must be set to a positive integer in the model config")
-        model_obj = SASRec(**model_cfg)
-        quantizer_obj = build_quantizer(args.quantizer, quantizer_cfg)
-        fit_sasrec(model_obj, quantizer_obj, train_loader, val_loader, train_cfg, device)
-        return
-
-    if args.model in {"espcn", "lstm"}:
-        raise NotImplementedError(f"Training for model '{args.model}' not implemented")
+        if args.model not in model_name_to_metric_fn:
+            raise ValueError(f"No metric mapping found for model '{args.model}'")
+        metric_fn = model_name_to_metric_fn[args.model](train_cfg)
+        fit_sasrec(model_obj, quantizer_obj, train_loader, val_loader, train_cfg, metric_fn, device)
+    else:
+        raise NotImplementedError
 
 
 if __name__ == "__main__":
