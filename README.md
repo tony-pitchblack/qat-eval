@@ -24,21 +24,57 @@ MacOS (M-series):
 docker pull --platform=linux/arm64 tonypitchblack/qat-eval:latest
 ```
 
-## Run Docker container
-The container automatically starts Jupyter and MLflow servers in dedicated tmux sessions.
-Make sure to pass free ports `JUPYTER_PORT` and `MLFLOW_PORT` as env vars (or put them in .env).
-
-To start new container run:
+## Basic Docker container usage
+To start the pulled container, run:
 ```bash
-docker run -it --rm --env-file .env --name qat-eval tonypitchblack/qat-eval:latest
+docker run -it --name qat-eval tonypitchblack/qat-eval:latest
 ```
 
-To reuse existing container run:
+To reuse an existing container, run:
 ```bash
 docker start -ai qat-eval
 ```
 
 To open repo inside the container in VS Code / Cursor IDE use `Dev Containers: Attach to Running Container` and open `/work/qat-eval` folder.
+
+## Advanced Docker container usage with Jupyter & MLflow
+To start Jupyter and MLflow servers in dedicated tmux sessions inside the container, first set up hosts/ports in `.env` file:
+```bash
+JUPYTER_PORT=8888
+MLFLOW_PORT=5000
+JUPYTER_HOST=127.0.0.1
+MLFLOW_HOST=127.0.0.1
+```
+
+To start docker container with port forwarding run:
+```bash
+source .env && docker run -it --rm \
+  --env-file .env \
+  --name qat-eval \
+  -p $JUPYTER_PORT:$JUPYTER_PORT \
+  -p $MLFLOW_PORT:$MLFLOW_PORT \
+  tonypitchblack/qat-eval:latest
+```
+
+Then start Jupyter and MLflow in separate tmux sessions:
+```bash
+micromamba run -n qat-eval tmux new -s jupyter -d \
+  "jupyter notebook \
+  --ip=$JUPYTER_HOST \
+  --port=$JUPYTER_PORT \
+  --no-browser \
+  --allow-root \
+  --NotebookApp.token="
+micromamba run -n qat-eval tmux new -s mlflow -d \
+  "mlflow server \
+  --host ${MLFLOW_HOST} \
+  --port ${MLFLOW_PORT}"
+```
+
+To reuse an existing container, run:
+```bash
+docker start -ai qat-eval
+```
 
 ## Docker build (linux + macos)
 ```bash

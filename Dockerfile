@@ -13,19 +13,11 @@ RUN micromamba run -n qat-eval git clone https://github.com/tony-pitchblack/qat-
 SHELL ["bash", "-lc"]
 ENV PATH=/opt/conda/envs/qat-eval/bin:$PATH
 EXPOSE 8888 5000
-CMD micromamba run -n qat-eval tmux new-session -d -s jupyter \
-      "jupyter lab \
-        --ip=0.0.0.0 \
-        --no-browser \
-        --NotebookApp.token='' \
-        --port=\${JUPYTER_PORT:-8888}" \
-  && micromamba run -n qat-eval tmux new-session -d -s mlflow \
-      "mlflow ui \
-        --host 0.0.0.0 \
-        --port \${MLFLOW_PORT:-5000}" \
-  && tail -f /dev/null
-
-WORKDIR /work/qat-eval
+ENV JUPYTER_PORT=8888 MLFLOW_PORT=5000
 
 RUN echo 'eval "$(micromamba shell hook -s bash)"' >> ~/.bashrc \
  && echo 'micromamba activate qat-eval' >> ~/.bashrc
+
+CMD ["micromamba","run","-n","qat-eval","bash"]
+
+WORKDIR /work/qat-eval
