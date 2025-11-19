@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 import os
 from tqdm.auto import tqdm
 from functools import partial
+from itertools import product
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -102,6 +103,30 @@ def resolve_default_model_config_path(model: str) -> str:
 
 def resolve_default_quantizer_config_path(quantizer: str) -> str:
     return os.path.join("configs", "quantizer_configs", f"{quantizer}_default.yml")
+
+
+def resolve_bit_width_grid_quantizer_config_path(quantizer: str) -> str:
+    return os.path.join("configs", "quantizer_configs", f"{quantizer}_bit_width_gridsearch.yml")
+
+
+def _expand_config_grid(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], ...]:
+    def _expand_node(node: Any):
+        if isinstance(node, dict):
+            keys = list(node.keys())
+            expanded_children = [ _expand_node(node[k]) for k in keys ]
+            combos = []
+            for values in product(*expanded_children):
+                combos.append({k: v for k, v in zip(keys, values)})
+            return combos
+        if isinstance(node, list):
+            variants = []
+            for v in node:
+                variants.extend(_expand_node(v))
+            return variants
+        return [node]
+
+    expanded = _expand_node(cfg)
+    return tuple(expanded)
 
 
 def _load_env_file(path: str) -> None:
@@ -365,7 +390,12 @@ def main():
         choices=["no_quant", "lsq", "pact", "adaround", "apot", "qil"],
     )
     parser.add_argument("--model-config", dest="model_config", default=None)
-    parser.add_argument("--quantizer-config", dest="quantizer_config", default=None)
+    parser.add_argument(
+        "--quantizer-config",
+        dest="quantizer_config",
+        default="default",
+        help="Path to quantizer config YAML or one of: 'default', 'bit_width_gridsearch'",
+    )
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default=None)
     parser.add_argument(
         "--logging-backend",
@@ -375,15 +405,33 @@ def main():
     )
     args = parser.parse_args()
 
-    model_cfg_path = args.model_config or resolve_default_model_config_path(args.model)
-    q_cfg_path = args.quantizer_config or resolve_default_quantizer_config_path(args.quantizer)
+    if args.model_config:
+        model_cfg_path = args.model_config
+    else:
+        model_cfg_path = resolve_default_model_config_path(args.model)
+
+    if args.quantizer_config in (None, "default"):
+        q_cfg_path = resolve_default_quantizer_config_path(args.quantizer)
+    elif args.quantizer_config == "bit_width_gridsearch":
+        q_cfg_path = resolve_bit_width_grid_quantizer_config_path(args.quantizer)
+    else:
+        q_cfg_path = args.quantizer_config
+
     cfg_model_full = load_yaml_config(model_cfg_path)
     cfg_quantizer_full = load_yaml_config(q_cfg_path)
 
-    model_cfg = cfg_model_full.get("model", {})
-    dataset_cfg = cfg_model_full.get("dataset", {})
-    train_cfg = cfg_model_full.get("training", {})
-    quantizer_cfg = cfg_quantizer_full.get("quantizer", {})
+    base_model_cfg = cfg_model_full.get("model", {})
+    base_dataset_cfg = cfg_model_full.get("dataset", {})
+    base_train_cfg = cfg_model_full.get("training", {})
+    base_quantizer_cfg = cfg_quantizer_full.get("quantizer", {})
+
+    combined_base_cfg: Dict[str, Any] = {
+        "model": base_model_cfg,
+        "dataset": base_dataset_cfg,
+        "training": base_train_cfg,
+        "quantizer": base_quantizer_cfg,
+    }
+    grid_cfgs = _expand_config_grid(combined_base_cfg)
 
     if args.device is None or args.device == "cpu":
         device = torch.device("cpu")
@@ -406,45 +454,13 @@ def main():
     model_cls = mapping["model_class"]
     dataset_cls = mapping["dataset_class"]
 
-    train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
-    val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
-
-    batch_size = int(train_cfg["batch_size"])
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=dataset_cls.collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=dataset_cls.collate_fn)
-
-    if args.model == "sasrec":
-        inferred = getattr(train_ds, "inferred_params", None)
-        if inferred is None:
-            raise ValueError("Dataset does not expose inferred_params needed for model construction")
-        if isinstance(inferred, dict):
-            inferred_dict = inferred
-        else:
-            inferred_dict = getattr(inferred, "__dict__", {}) or {}
-        num_items = int(inferred_dict.get("num_items", 0))
-        if num_items <= 0:
-            raise ValueError("Failed to infer a positive num_items from inferred_params")
-        inferred_dict = {**inferred_dict, "num_items": num_items}
-        model_obj = model_cls(**{**model_cfg, **inferred_dict})
-    elif args.model == "simple_cnn":
-        model_obj = model_cls(**model_cfg)
-    else:
-        raise NotImplementedError(f"Model '{args.model}' not fully wired for construction")
-
-    quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
-    if quantizer_cls is None:
-        raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
-    quantizer_obj = quantizer_cls(**quantizer_cfg)
-    if isinstance(quantizer_obj, LSQQuantizer):
-        quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
-
     mlflow_client = None
     if args.logging_backend == "mlflow":
         mlflow_tracking_uri = get_mlflow_tracking_uri()
         import mlflow  # type: ignore[import]
 
         mlflow.set_tracking_uri(mlflow_tracking_uri)
-        mlflow.set_experiment("QAT eval")
+        mlflow.set_experiment(f"QAT-eval-{args.model}")
         mlflow_client = mlflow
 
     if args.model == "sasrec":
@@ -453,33 +469,98 @@ def main():
             raise ValueError(f"No metric mapping found for model '{args.model}'")
         metric_name = metric_cfg["metric_name"]
         metric_fn = metric_cfg["metric_fn"]
-        if mlflow_client is not None:
-            run_config = {
-                "model": args.model,
-                "quantizer": args.quantizer,
-                "model_cfg": model_cfg,
-                "dataset_cfg": dataset_cfg,
-                "train_cfg": train_cfg,
-                "quantizer_cfg": quantizer_cfg,
-            }
-            config_str = json.dumps(run_config, sort_keys=True, default=str)
-            hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-            run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
-            with mlflow_client.start_run(run_name=run_name):
-                all_params: Dict[str, Any] = {
-                    "model_name": args.model,
-                    "quantizer_name": args.quantizer,
-                    "batch_size": int(train_cfg.get("batch_size", 0)),
+        for cfg in grid_cfgs:
+            model_cfg = cfg.get("model", {})
+            dataset_cfg = cfg.get("dataset", {})
+            train_cfg = cfg.get("training", {})
+            quantizer_cfg = cfg.get("quantizer", {})
+
+            train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
+            val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
+
+            inferred = getattr(train_ds, "inferred_params", None)
+            if inferred is None:
+                raise ValueError("Dataset does not expose inferred_params needed for model construction")
+            if isinstance(inferred, dict):
+                inferred_dict = inferred
+            else:
+                inferred_dict = getattr(inferred, "__dict__", {}) or {}
+            num_items = int(inferred_dict.get("num_items", 0))
+            if num_items <= 0:
+                raise ValueError("Failed to infer a positive num_items from inferred_params")
+            inferred_dict = {**inferred_dict, "num_items": num_items}
+            model_obj = model_cls(**{**model_cfg, **inferred_dict})
+
+            batch_size = int(train_cfg["batch_size"])
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=dataset_cls.collate_fn,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=dataset_cls.collate_fn,
+            )
+
+            quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
+            if quantizer_cls is None:
+                raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
+            quantizer_obj = quantizer_cls(**quantizer_cfg)
+            if isinstance(quantizer_obj, LSQQuantizer):
+                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+
+            bit_width = getattr(quantizer_obj, "bit_width", None)
+            if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
+                bit_width = getattr(quantizer_obj._quantizer, "bit_width", None)
+            if bit_width is not None:
+                print(f"Using quantization bit width: {bit_width}")
+            else:
+                print("No quantization is used")
+
+            if mlflow_client is not None:
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
                 }
-                for section_name, section_cfg in [
-                    ("model", model_cfg),
-                    ("dataset", dataset_cfg),
-                    ("training", train_cfg),
-                    ("quantizer", quantizer_cfg),
-                ]:
-                    for k, v in section_cfg.items():
-                        all_params[f"{section_name}.{k}"] = v
-                mlflow_client.log_params(all_params)
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                with mlflow_client.start_run(run_name=run_name):
+                    all_params: Dict[str, Any] = {
+                        "model_name": args.model,
+                        "quantizer_name": args.quantizer,
+                        "batch_size": int(train_cfg.get("batch_size", 0)),
+                    }
+                    for section_name, section_cfg in [
+                        ("model", model_cfg),
+                        ("dataset", dataset_cfg),
+                        ("training", train_cfg),
+                        ("quantizer", quantizer_cfg),
+                    ]:
+                        for k, v in section_cfg.items():
+                            all_params[f"{section_name}.{k}"] = v
+                    mlflow_client.log_params(all_params)
+                    fit_sasrec(
+                        model_obj,
+                        quantizer_obj,
+                        train_loader,
+                        val_loader,
+                        train_cfg,
+                        metric_fn,
+                        metric_name,
+                        device,
+                        logging_backend="mlflow",
+                        mlflow_client=mlflow_client,
+                    )
+                    model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+            else:
                 fit_sasrec(
                     model_obj,
                     quantizer_obj,
@@ -489,52 +570,92 @@ def main():
                     metric_fn,
                     metric_name,
                     device,
-                    logging_backend="mlflow",
-                    mlflow_client=mlflow_client,
                 )
-                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
-        else:
-            fit_sasrec(
-                model_obj,
-                quantizer_obj,
-                train_loader,
-                val_loader,
-                train_cfg,
-                metric_fn,
-                metric_name,
-                device,
-            )
-            model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
         metric_name = "accuracy"
         metric_fn = accuracy
-        if mlflow_client is not None:
-            run_config = {
-                "model": args.model,
-                "quantizer": args.quantizer,
-                "model_cfg": model_cfg,
-                "dataset_cfg": dataset_cfg,
-                "train_cfg": train_cfg,
-                "quantizer_cfg": quantizer_cfg,
-            }
-            config_str = json.dumps(run_config, sort_keys=True, default=str)
-            hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-            run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
-            with mlflow_client.start_run(run_name=run_name):
-                all_params: Dict[str, Any] = {
-                    "model_name": args.model,
-                    "quantizer_name": args.quantizer,
-                    "batch_size": int(train_cfg.get("batch_size", 0)),
+        for cfg in grid_cfgs:
+            model_cfg = cfg.get("model", {})
+            dataset_cfg = cfg.get("dataset", {})
+            train_cfg = cfg.get("training", {})
+            quantizer_cfg = cfg.get("quantizer", {})
+
+            train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
+            val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
+
+            model_obj = model_cls(**model_cfg)
+
+            batch_size = int(train_cfg["batch_size"])
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=dataset_cls.collate_fn,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=dataset_cls.collate_fn,
+            )
+
+            quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
+            if quantizer_cls is None:
+                raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
+            quantizer_obj = quantizer_cls(**quantizer_cfg)
+            if isinstance(quantizer_obj, LSQQuantizer):
+                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+
+            bit_width = getattr(quantizer_obj, "bit_width", None)
+            if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
+                bit_width = getattr(quantizer_obj._quantizer, "bit_width", None)
+            if bit_width is not None:
+                print(f"Using quantization bit width: {bit_width}")
+            else:
+                print("No quantization is used")
+
+            if mlflow_client is not None:
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
                 }
-                for section_name, section_cfg in [
-                    ("model", model_cfg),
-                    ("dataset", dataset_cfg),
-                    ("training", train_cfg),
-                    ("quantizer", quantizer_cfg),
-                ]:
-                    for k, v in section_cfg.items():
-                        all_params[f"{section_name}.{k}"] = v
-                mlflow_client.log_params(all_params)
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                with mlflow_client.start_run(run_name=run_name):
+                    all_params: Dict[str, Any] = {
+                        "model_name": args.model,
+                        "quantizer_name": args.quantizer,
+                        "batch_size": int(train_cfg.get("batch_size", 0)),
+                    }
+                    for section_name, section_cfg in [
+                        ("model", model_cfg),
+                        ("dataset", dataset_cfg),
+                        ("training", train_cfg),
+                        ("quantizer", quantizer_cfg),
+                    ]:
+                        for k, v in section_cfg.items():
+                            all_params[f"{section_name}.{k}"] = v
+                    mlflow_client.log_params(all_params)
+                    fit_simple_cnn(
+                        model_obj,
+                        quantizer_obj,
+                        train_loader,
+                        val_loader,
+                        train_cfg,
+                        metric_fn,
+                        metric_name,
+                        device,
+                        logging_backend="mlflow",
+                        mlflow_client=mlflow_client,
+                    )
+                    model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+            else:
                 fit_simple_cnn(
                     model_obj,
                     quantizer_obj,
@@ -544,22 +665,8 @@ def main():
                     metric_fn,
                     metric_name,
                     device,
-                    logging_backend="mlflow",
-                    mlflow_client=mlflow_client,
                 )
-                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
-        else:
-            fit_simple_cnn(
-                model_obj,
-                quantizer_obj,
-                train_loader,
-                val_loader,
-                train_cfg,
-                metric_fn,
-                metric_name,
-                device,
-            )
-            model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
 
 
 if __name__ == "__main__":
