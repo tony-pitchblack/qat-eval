@@ -42,7 +42,7 @@ From inside the container (or a local environment with dependencies installed), 
 ```bash
 python main.py \
   --model {sasrec,espcn,lstm,simple_cnn} \
-  --quantizer {dummy,lsq,pact,adaround,apot,qil} \
+  --quantizer {no_quant,lsq,pact,adaround,apot,qil} \
   [--model-config PATH] \
   [--quantizer-config PATH] \
   [--device cpu|cuda|mps] \
@@ -51,22 +51,22 @@ python main.py \
 
 Basic usage (automatically use default configs):
 ```bash
-python main.py --model sasrec --quantizer dummy
+python main.py --model sasrec --quantizer no_quant
 ```
 
 To run with custom configs:
 ```bash
 python main.py \
   --model sasrec \
-  --quantizer dummy \
+  --quantizer no_quant \
   --device cpu \
   --model-config configs/sasrec_custom.yaml \
-  --quantizer-config configs/dummy_custom.yaml
+  --quantizer-config configs/no_quant_custom.yaml
 ```
 
 To use MLflow logging see section "Advanced Docker container usage with Jupyter & MLflow" and then enable it via `--logging-backend mlflow` option:
 ```bash
-python main.py --model sasrec --quantizer dummy --logging-backend mlflow
+python main.py --model sasrec --quantizer no_quant --logging-backend mlflow
 ```
 
 ## Advanced Docker container usage with Jupyter & MLflow

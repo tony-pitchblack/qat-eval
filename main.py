@@ -50,7 +50,7 @@ model_name_to_model_dataset_class = {
 }
 
 # Import quantizers
-from quantizers.dummy import DummyQuantizer
+from quantizers.no_quant import NoQuantizer
 from quantizers.lsq import LSQQuantizer, LSQQuantizerWrapper
 from quantizers.pact import PACTQuantizer
 from quantizers.adaround import AdaRoundQuantizer
@@ -59,7 +59,7 @@ from quantizers.qil import QILQuantizer
 
 # Uncomment quantizers as they get implemented
 quantizer_name_to_quantizer_class = {
-    "dummy": DummyQuantizer,
+    "no_quant": NoQuantizer,
     "lsq": LSQQuantizer,
     # "pact": PACTQuantizer,
     # "adaround": AdaRoundQuantizer,
@@ -313,7 +313,7 @@ def main():
     parser.add_argument(
         "--quantizer",
         required=True,
-        choices=["dummy", "lsq", "pact", "adaround", "apot", "qil"],
+        choices=["no_quant", "lsq", "pact", "adaround", "apot", "qil"],
     )
     parser.add_argument("--model-config", dest="model_config", default=None)
     parser.add_argument("--quantizer-config", dest="quantizer_config", default=None)
