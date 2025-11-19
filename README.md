@@ -41,7 +41,7 @@ To open repo inside the container in VS Code / Cursor IDE use `Dev Containers: A
 From inside the container (or a local environment with dependencies installed), you can launch training with `main.py`:
 ```bash
 python main.py \
-  --model {sasrec,espcn,lstm} \
+  --model {sasrec,espcn,lstm,simple_cnn} \
   --quantizer {dummy,lsq,pact,adaround,apot,qil} \
   [--model-config PATH] \
   [--quantizer-config PATH] \
