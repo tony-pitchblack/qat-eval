@@ -6,8 +6,8 @@ from ._base import BaseQuantizer
 
 
 class NoQuantizer(BaseQuantizer):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, bit_width: int = 16, per_channel: bool = True):
+        super().__init__(bit_width=bit_width, per_channel=per_channel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
@@ -15,6 +15,8 @@ class NoQuantizer(BaseQuantizer):
     def export_params(self) -> Dict[str, Any]:
         return {
             "type": "no_quant",
+            "bit_width": self.bit_width,
+            "per_channel": self.per_channel,
         }
 
 
