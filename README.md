@@ -88,16 +88,22 @@ source .env && docker run -it --rm \
   tonypitchblack/qat-eval:latest
 ```
 
-Then start Jupyter and MLflow in separate tmux sessions:
+To start Jupyter in tmux session run:
 ```bash
-micromamba run -n qat-eval tmux new -s jupyter -d \
+micromamba activate qat-eval && \
+tmux new -s jupyter -d \
   "jupyter notebook \
   --ip=$JUPYTER_HOST \
   --port=$JUPYTER_PORT \
   --no-browser \
   --allow-root \
   --NotebookApp.token="
-micromamba run -n qat-eval tmux new -s mlflow -d \
+```
+
+To start MLflow in tmux session run:
+```bash
+micromamba activate qat-eval && \
+tmux new -s mlflow -d \
   "mlflow server \
   --host ${MLFLOW_HOST} \
   --port ${MLFLOW_PORT}"
