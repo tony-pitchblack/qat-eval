@@ -37,6 +37,38 @@ docker start -ai qat-eval
 
 To open repo inside the container in VS Code / Cursor IDE use `Dev Containers: Attach to Running Container` and open `/work/qat-eval` folder.
 
+## Run training
+From inside the container (or a local environment with dependencies installed), you can launch training with `main.py`:
+```bash
+python main.py \
+  --model {sasrec,espcn,lstm} \
+  --quantizer {base,dummy,lsq,pact,adaround,apot,qil} \
+  [--model-config PATH] \
+  [--quantizer-config PATH] \
+  [--device cpu|cuda|mps] \
+  [--logging-backend none|mlflow]
+```
+
+Basic usage (automatically use default configs):
+```bash
+python main.py --model sasrec --quantizer dummy
+```
+
+To run with custom configs:
+```bash
+python main.py \
+  --model sasrec \
+  --quantizer dummy \
+  --device cpu \
+  --model-config configs/sasrec_custom.yaml \
+  --quantizer-config configs/dummy_custom.yaml
+```
+
+To use MLflow logging see section "Advanced Docker container usage with Jupyter & MLflow" and then enable it via `--logging-backend mlflow` option:
+```bash
+python main.py --model sasrec --quantizer dummy --logging-backend mlflow
+```
+
 ## Advanced Docker container usage with Jupyter & MLflow
 To start Jupyter and MLflow servers in dedicated tmux sessions inside the container, first set up hosts/ports in `.env` file:
 ```bash
