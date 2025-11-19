@@ -61,6 +61,10 @@ class LSQConv2d(nn.Module):
             self.weight_quant.init_from(self.conv.weight)
             if self.conv.bias is not None:
                 self.bias_quant.init_from(self.conv.bias)
+        # Expose weight and bias so external code that accesses
+        # module.weight / module.bias continues to work.
+        self.weight = self.conv.weight
+        self.bias = self.conv.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q_act = self.act_quant(x)
@@ -90,6 +94,10 @@ class LSQLinear(nn.Module):
             self.weight_quant.init_from(self.fc.weight)
             if self.fc.bias is not None:
                 self.bias_quant.init_from(self.fc.bias)
+        # Expose weight and bias so modules like MultiheadAttention
+        # that access out_proj.weight / .bias keep working.
+        self.weight = self.fc.weight
+        self.bias = self.fc.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q_act = self.act_quant(x)
