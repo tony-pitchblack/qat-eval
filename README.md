@@ -5,7 +5,6 @@
 | Method   | LSTM      |          | SASRec    |          | ESPCN     |          |
 |----------|-----------|----------|-----------|----------|-----------|----------|
 |          | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   | Metric Δ  | Size Δ   |
-| No QAT   |           |          |           |          |           |          |
 | LSQ      |           |          |           |          |           |          |
 | PACT     |           |          |           |          |           |          |
 | AdaRound |           |          |           |          |           |          |
