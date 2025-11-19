@@ -45,7 +45,7 @@ model_name_to_model_dataset_class = {
 
 # Import quantizers
 from quantizers.dummy import DummyQuantizer
-from quantizers.lsq import LSQQuantizer
+from quantizers.lsq import LSQQuantizer, LSQQuantizerWrapper
 from quantizers.pact import PACTQuantizer
 from quantizers.adaround import AdaRoundQuantizer
 from quantizers.apot import APoTQuantizer
@@ -140,6 +140,11 @@ def fit_sasrec(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
+    if isinstance(quantizer_module, LSQQuantizerWrapper):
+        model = quantizer_module.prepare_model(model).to(device)
+
+    def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
+        return quantizer_module(x)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -156,7 +161,7 @@ def fit_sasrec(
             input_lengths = input_lengths.to(device)
             targets = targets.to(device)
             logits = model(inputs, input_lengths)
-            logits = quantizer_module(logits)
+            logits = apply_quantizer(logits)
             loss = criterion(logits, targets)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -179,7 +184,7 @@ def fit_sasrec(
                     input_lengths = input_lengths.to(device)
                     targets = targets.to(device)
                     logits = model(inputs, input_lengths)
-                    logits = quantizer_module(logits)
+                    logits = apply_quantizer(logits)
                     loss = criterion(logits, targets)
                     batch_size = targets.size(0)
                     val_loss_sum += loss.item() * batch_size
@@ -280,6 +285,8 @@ def main():
     if quantizer_cls is None:
         raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
     quantizer_obj = quantizer_cls(**quantizer_cfg)
+    if isinstance(quantizer_obj, LSQQuantizer):
+        quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
 
     mlflow_client = None
     if args.logging_backend == "mlflow":
