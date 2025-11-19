@@ -2,6 +2,7 @@
 
 # Basic imports
 import argparse
+import warnings
 from typing import Any, Dict, Tuple
 import torch
 import yaml
@@ -9,6 +10,7 @@ from torch.utils.data import DataLoader
 import os
 from tqdm.auto import tqdm
 
+warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 # Import models & datasets
@@ -78,15 +80,6 @@ def resolve_default_model_config_path(model: str) -> str:
 
 def resolve_default_quantizer_config_path(quantizer: str) -> str:
     return os.path.join("configs", "quantizer_configs", f"{quantizer}_default.yml")
-
-
-def select_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    # has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    # if has_mps:
-    #     return torch.device("mps")
-    return torch.device("cpu")
 
 
 def fit_sasrec(
@@ -172,6 +165,7 @@ def main():
     )
     parser.add_argument("--model-config", dest="model_config", default=None)
     parser.add_argument("--quantizer-config", dest="quantizer_config", default=None)
+    parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default=None)
     args = parser.parse_args()
 
     model_cfg_path = args.model_config or resolve_default_model_config_path(args.model)
@@ -184,7 +178,20 @@ def main():
     train_cfg = cfg_model_full.get("training", {})
     quantizer_cfg = cfg_quantizer_full.get("quantizer", {})
 
-    device = select_device()
+    if args.device is None or args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is not available")
+        device = torch.device("cuda")
+    elif args.device == "mps":
+        has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if not has_mps:
+            raise ValueError("MPS device requested but MPS is not available")
+        device = torch.device("mps")
+    else:
+        raise ValueError(f"Unsupported device option: {args.device}")
+    print(f"Training on device: {device}")
 
     mapping = model_name_to_model_dataset_class.get(args.model)
     if mapping is None:
