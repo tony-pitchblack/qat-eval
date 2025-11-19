@@ -20,3 +20,9 @@ def ndcg_at_k(preds, targets, k=10):
     idcg = torch.ones_like(dcg)
     ndcg = dcg / idcg
     return ndcg.mean().item()
+
+def psnr(*args, **kwargs):
+    raise NotImplementedError
+
+def rocauc(*args, **kwargs):
+    raise NotImplementedError
