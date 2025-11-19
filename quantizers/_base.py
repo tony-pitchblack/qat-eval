@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 
 class BaseQuantizer(nn.Module, ABC):
-    def __init__(self, bit_width: int, per_channel: bool = False):
+    def __init__(self, bit_width: int = None, per_channel: bool = False):
         super().__init__()
         self.bit_width = bit_width
         self.per_channel = per_channel
