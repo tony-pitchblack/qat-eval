@@ -27,6 +27,7 @@ class SASRecModel(nn.Module):
         self.pad_token_id = int(pad_token_id)
         self.device_ref = torch.device(device) if isinstance(device, str) else device
 
+        # indices: 0 is pad, 1..num_items are real items
         self.item_embedding = nn.Embedding(self.num_items + 1, self.hidden_size)
         self.positional_embedding = nn.Embedding(self.max_seq_len, self.hidden_size)
         self.embedding_dropout = nn.Dropout(dropout)
@@ -42,7 +43,8 @@ class SASRecModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
         self.final_norm = nn.LayerNorm(self.hidden_size, eps=1e-8)
-        self.output = nn.Linear(self.hidden_size, self.num_items)
+        # logits over indices 0..num_items (0 is unused/pad)
+        self.output = nn.Linear(self.hidden_size, self.num_items + 1)
 
     def forward(self, item_sequence, sequence_lengths):
         dev = self.device_ref if self.device_ref is not None else (item_sequence.device if isinstance(item_sequence, torch.Tensor) else "cpu")
@@ -60,7 +62,7 @@ class SASRecModel(nn.Module):
         x = x + self.positional_embedding(positions)
         x = self.embedding_dropout(x)
 
-        pad_mask = (items_t == self.pad_token_id) | (items_t == self.num_items)
+        pad_mask = (items_t == self.pad_token_id)
         attn_mask = _generate_subsequent_mask(seq_len, device=dev)
 
         x = self.encoder(x, mask=attn_mask, src_key_padding_mask=pad_mask)

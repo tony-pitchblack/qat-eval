@@ -83,9 +83,9 @@ def resolve_default_quantizer_config_path(quantizer: str) -> str:
 def select_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    if has_mps:
-        return torch.device("mps")
+    # has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    # if has_mps:
+    #     return torch.device("mps")
     return torch.device("cpu")
 
 
