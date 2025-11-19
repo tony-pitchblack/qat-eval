@@ -1,6 +1,5 @@
 model:
-  num_items: 0
-  max_seq_len: 100
+  max_seq_len: 10
   hidden_size: 64
   num_heads: 2
   num_layers: 2
@@ -8,7 +7,7 @@ model:
   pad_token_id: 0
 
 dataset:
-  root_dir: TIFUKNN/data
+  root_dir: external_repos/TIFUKNN/data
   dataset: Dunnhumby
   min_len: 2
 
