@@ -143,6 +143,9 @@ class LSQLayerNorm(nn.Module):
                 self.bias_quant.init_from(self.ln.bias)
         self.weight = self.ln.weight
         self.bias = self.ln.bias
+        # Expose attributes expected from nn.LayerNorm
+        self.eps = self.ln.eps
+        self.normalized_shape = self.ln.normalized_shape
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self.ln.weight
@@ -162,6 +165,20 @@ class LSQMultiheadAttention(nn.Module):
         self.embed_dim = attn.embed_dim
         self.num_heads = attn.num_heads
         self.batch_first = getattr(attn, "batch_first", False)
+
+        # Expose standard MultiheadAttention attributes so external
+        # modules (e.g., TransformerEncoderLayer) can access them.
+        self.in_proj_weight = attn.in_proj_weight
+        self.in_proj_bias = attn.in_proj_bias
+        self.q_proj_weight = getattr(attn, "q_proj_weight", None)
+        self.k_proj_weight = getattr(attn, "k_proj_weight", None)
+        self.v_proj_weight = getattr(attn, "v_proj_weight", None)
+        self.out_proj = attn.out_proj
+        self.bias_k = attn.bias_k
+        self.bias_v = attn.bias_v
+        self.add_zero_attn = attn.add_zero_attn
+        self.dropout = attn.dropout
+        self._qkv_same_embed_dim = attn._qkv_same_embed_dim
 
         self.in_proj_weight_quant = None
         self.in_proj_bias_quant = None
