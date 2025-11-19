@@ -1,0 +1,20 @@
+model:
+  num_items: 0
+  max_seq_len: 100
+  hidden_size: 64
+  num_heads: 2
+  num_layers: 2
+  dropout: 0.1
+  pad_token_id: 0
+
+dataset:
+  root_dir: TIFUKNN/data
+  dataset: Dunnhumby
+  min_len: 2
+
+training:
+  batch_size: 128
+  epochs: 1
+  lr: 0.001
+  weight_decay: 0.0
+
