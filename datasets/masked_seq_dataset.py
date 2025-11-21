@@ -19,6 +19,13 @@ def _tifuknn_name_map(dataset: str) -> Tuple[str, str]:
     return mapping[dataset]
 
 
+def get_tifuknn_paths(root_dir: str, dataset: str) -> Tuple[str, str]:
+    train_file, val_file = _tifuknn_name_map(dataset)
+    train_path = os.path.join(root_dir, train_file)
+    val_path = os.path.join(root_dir, val_file)
+    return train_path, val_path
+
+
 def load_tifuknn_dfs(root_dir: str, dataset: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     train_file, val_file = _tifuknn_name_map(dataset)
     dtypes = {"CUSTOMER_ID": "int64", "ORDER_NUMBER": "int64", "MATERIAL_NUMBER": "int64"}

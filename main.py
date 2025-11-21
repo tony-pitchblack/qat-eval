@@ -8,27 +8,22 @@ import hashlib
 import json
 import os
 
+import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from functools import partial
 from itertools import product
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Import models & datasets
 from models.sasrec import SASRecModel
 from datasets.next_item_dataset import NextItemDataset
 from models.simple_cnn import SimpleCNN
 from datasets.mnist_dataset import MNISTDataset
-from metrics import ndcg_at_k, accuracy
-from datasets.masked_seq_dataset import (
-    MaskedSeqDataset,
-    load_tifuknn_dfs,
-    build_sequences_from_df,
-)
+from metrics import model_name_to_metrics
+from datasets.masked_seq_dataset import MaskedSeqDataset, load_tifuknn_dfs, build_sequences_from_df, get_tifuknn_paths
 
 from models.lstm import LSTMModel
 from datasets.dummy_lstm_dataset import DummyLSTMDataset
@@ -66,7 +61,6 @@ from quantizers.adaround import AdaRoundQuantizer
 from quantizers.apot import APoTQuantizer
 from quantizers.qil import QILQuantizer
 
-# Uncomment quantizers as they get implemented
 quantizer_name_to_quantizer_class = {
     "no_quant": NoQuantizer,
     "lsq": LSQQuantizer,
@@ -74,23 +68,6 @@ quantizer_name_to_quantizer_class = {
     # "adaround": AdaRoundQuantizer,
     # "apot": APoTQuantizer,
     # "qil": QILQuantizer,
-}
-
-model_name_to_metric = {
-    "sasrec": {
-        "metric_name": f"NDCG_at_{10}",
-        "metric_fn": partial(ndcg_at_k, k=10),
-    },
-
-    # "lstm": {
-    #     "metric_name": "ROCAUC",
-    #     "metric_fn": rocauc  # import rocauc when enabling LSTM
-    # },
-
-    # "espcn": {
-    #     "metric_name": "PSNR",
-    #     "metric_fn": psnr    # import psnr when enabling ESPCN
-    # },
 }
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -204,6 +181,22 @@ def _finalize_model_size(
             f"(delta: {delta_pct:.2f}%)"
         )
     return model
+
+
+def _log_mlflow_dataset(mlflow_client, train_path: str, dataset_name: str) -> None:
+    try:
+        import mlflow.data as mlfd  # type: ignore[import]
+        abs_src = os.path.abspath(train_path)
+        try:
+            from mlflow.data.dataset_source import LocalArtifactDatasetSource  # type: ignore[import]
+
+            src_obj = LocalArtifactDatasetSource(abs_src)
+            ds_obj = mlfd.from_pandas(pd.DataFrame(), source=src_obj, name=str(dataset_name))
+        except Exception:
+            ds_obj = mlfd.from_pandas(pd.DataFrame(), source=abs_src, name=str(dataset_name))
+        mlflow_client.log_input(ds_obj, context="training")
+    except Exception:
+        pass
 
 def _sample_negatives(
     true_ids: torch.Tensor,
@@ -458,8 +451,8 @@ def fit_sasrec(
             mlflow_client.log_metric(f"train_{metric_name}", train_metric_avg, step=epoch + 1)
             mlflow_client.log_metric("val_loss", val_loss_avg, step=epoch + 1)
             mlflow_client.log_metric(f"val_{metric_name}", val_metric_avg, step=epoch + 1)
-            mlflow_client.log_metric(f"max_train_{metric_name}", best_train_metric, step=epoch + 1)
-            mlflow_client.log_metric(f"max_val_{metric_name}", best_val_metric, step=epoch + 1)
+            mlflow_client.log_metric(f"train_max_{metric_name}", best_train_metric, step=epoch + 1)
+            mlflow_client.log_metric(f"val_max_{metric_name}", best_val_metric, step=epoch + 1)
 
         header = f"{'':12}{'Train':>12}{'Val':>12}"
         loss_row = f"{'Loss':12}{train_loss_avg:12.4f}{val_loss_avg:12.4f}"
@@ -725,7 +718,11 @@ def main():
                 }
                 config_str = json.dumps(run_config, sort_keys=True, default=str)
                 hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
                 with mlflow_client.start_run(run_name=run_name):
                     all_params: Dict[str, Any] = {
                         "model_name": args.model,
@@ -742,6 +739,18 @@ def main():
                             all_params[f"{section_name}.{k}"] = v
                     mlflow_client.log_params(all_params)
 
+                    if dataset_for_run:
+                        train_path, _ = get_tifuknn_paths(root_dir, dataset_for_run)
+                        try:
+                            mlflow_client.set_tag("Dataset", str(dataset_for_run))
+                        except Exception:
+                            pass
+                        _log_mlflow_dataset(mlflow_client, train_path, str(dataset_for_run))
+
+                    sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
+                    best_train_metrics: Dict[str, float] = {}
+                    best_val_metrics: Dict[str, float] = {}
+
                     total_epochs = int(train_cfg.get("epochs", 1))
                     for ep in range(total_epochs):
                         avg_loss = _train_one_epoch_sasrec_masked(
@@ -754,8 +763,24 @@ def main():
                             quantizer_module=quantizer_module,
                         )
                         log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
+
+                        train_rank_metrics = _evaluate_sampled_sasrec(
+                            model=model_obj,
+                            sequences=sequences_train,
+                            max_seq_len=max_seq_len,
+                            min_seq_len=min_len,
+                            pad_token_id=pad_token_id,
+                            mask_token_id=mask_token_id,
+                            max_item_id=max_item_id,
+                            device=device,
+                            ks=(5, 10, 20),
+                            sampled_neg_k=1000,
+                            batch_size=512,
+                            max_batches=None,
+                        )
+                        val_rank_metrics: Dict[str, float] = {}
                         if sequences_val:
-                            val_metrics = _evaluate_sampled_sasrec(
+                            val_rank_metrics = _evaluate_sampled_sasrec(
                                 model=model_obj,
                                 sequences=sequences_val,
                                 max_seq_len=max_seq_len,
@@ -769,16 +794,37 @@ def main():
                                 batch_size=512,
                                 max_batches=None,
                             )
-                            for k, v in val_metrics.items():
-                                log_payload[k] = float(v)
-                            metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_metrics.items()])
+
+                        for metric_name, _ in sasrec_metrics_cfg:
+                            train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                            val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
+                                "nan"
+                            )
+                            prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                            prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                            best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                            best_val_metrics[metric_name] = max(prev_val_best, val_val)
+                            log_payload[f"train_{metric_name}"] = train_val
+                            log_payload[f"val_{metric_name}"] = val_val
+                            log_payload[f"train_max_{metric_name}"] = best_train_metrics[metric_name]
+                            log_payload[f"val_max_{metric_name}"] = best_val_metrics[metric_name]
+
+                        if sequences_val:
+                            metrics_str = " ".join(
+                                [f"{k}={v:.4f}" for k, v in val_rank_metrics.items()]
+                            )
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
                         else:
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
+
                         mlflow_client.log_metrics(log_payload, step=ep + 1)
 
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
             else:
+                sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
+                best_train_metrics: Dict[str, float] = {}
+                best_val_metrics: Dict[str, float] = {}
+
                 total_epochs = int(train_cfg.get("epochs", 1))
                 for ep in range(total_epochs):
                     avg_loss = _train_one_epoch_sasrec_masked(
@@ -790,8 +836,23 @@ def main():
                         grad_clip=float(grad_clip) if grad_clip is not None else None,
                         quantizer_module=quantizer_module,
                     )
+                    train_rank_metrics = _evaluate_sampled_sasrec(
+                        model=model_obj,
+                        sequences=sequences_train,
+                        max_seq_len=max_seq_len,
+                        min_seq_len=min_len,
+                        pad_token_id=pad_token_id,
+                        mask_token_id=mask_token_id,
+                        max_item_id=max_item_id,
+                        device=device,
+                        ks=(5, 10, 20),
+                        sampled_neg_k=1000,
+                        batch_size=512,
+                        max_batches=None,
+                    )
+                    val_rank_metrics: Dict[str, float] = {}
                     if sequences_val:
-                        val_metrics = _evaluate_sampled_sasrec(
+                        val_rank_metrics = _evaluate_sampled_sasrec(
                             model=model_obj,
                             sequences=sequences_val,
                             max_seq_len=max_seq_len,
@@ -805,15 +866,29 @@ def main():
                             batch_size=512,
                             max_batches=None,
                         )
-                        metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_metrics.items()])
+
+                    for metric_name, _ in sasrec_metrics_cfg:
+                        train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                        val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
+                            "nan"
+                        )
+                        prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                        prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                        best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                        best_val_metrics[metric_name] = max(prev_val_best, val_val)
+
+                    if sequences_val:
+                        metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_rank_metrics.items()])
                         print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
                     else:
                         print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
 
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
-        metric_name = "accuracy"
-        metric_fn = accuracy
+        metrics_cfg = model_name_to_metrics.get(args.model)
+        if not metrics_cfg:
+            raise ValueError(f"No metric mapping found for model '{args.model}'")
+        metric_name, metric_fn = metrics_cfg[0]
         for cfg in grid_cfgs:
             model_cfg = cfg.get("model", {})
             dataset_cfg = cfg.get("dataset", {})
@@ -865,7 +940,11 @@ def main():
                 }
                 config_str = json.dumps(run_config, sort_keys=True, default=str)
                 hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
                 with mlflow_client.start_run(run_name=run_name):
                     all_params: Dict[str, Any] = {
                         "model_name": args.model,
