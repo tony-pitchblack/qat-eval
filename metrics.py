@@ -38,13 +38,20 @@ def rocauc(preds, targets):
     except ImportError:
         raise ImportError("sklearn is required for ROC AUC computation. Install with: pip install scikit-learn")
 
+    targets_np = targets.detach().cpu().numpy()
+    
+    # Check if we have both classes
+    unique_classes = len(set(targets_np))
+    if unique_classes < 2:
+        print(f"Warning: Only {unique_classes} class(es) in targets, cannot compute ROC AUC")
+        return float('nan')
+    
     # Convert logits to probabilities
     if preds.dim() > 1 and preds.size(1) > 1:
         probs = torch.softmax(preds, dim=1)[:, 1].detach().cpu().numpy()
     else:
         probs = torch.sigmoid(preds.squeeze()).detach().cpu().numpy()
 
-    targets_np = targets.detach().cpu().numpy()
     return roc_auc_score(targets_np, probs)
 
 
