@@ -66,8 +66,8 @@ quantizer_name_to_quantizer_class = {
     "lsq": LSQQuantizer,
     # "pact": PACTQuantizer,
     "adaround": AdaRoundQuantizer,
-    # "apot": APoTQuantizer,
-    # "qil": QILQuantizer,
+    "apot": APoTQuantizer,
+    "qil": QILQuantizer,
 }
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
