@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 import torch
 
-from ._base import BaseQuantizer
+from ._base import BaseQuantizer, BaseQuantizerWrapper
 
 
 class NoQuantizer(BaseQuantizer):
@@ -18,6 +18,11 @@ class NoQuantizer(BaseQuantizer):
             "bit_width": self.bit_width,
             "per_channel": self.per_channel,
         }
+
+
+class NoQuantizerWrapper(BaseQuantizerWrapper):
+    def __init__(self, quantizer: NoQuantizer, logging_backend: str = "none"):
+        super().__init__(quantizer, logging_backend=logging_backend)
 
 
 

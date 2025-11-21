@@ -20,13 +20,19 @@ class BaseQuantizer(nn.Module, ABC):
 
 
 class BaseQuantizerWrapper(nn.Module, ABC):
-    def __init__(self, quantizer: BaseQuantizer):
+    def __init__(self, quantizer: BaseQuantizer, logging_backend: str = "none"):
         super().__init__()
         self._quantizer = quantizer
+        self.logging_backend = logging_backend
 
-    @abstractmethod
-    def prepare_model(self, model: nn.Module) -> nn.Module:
-        ...
+    def prepare_qat_model(self, model: nn.Module) -> nn.Module:
+        return model
+
+    def prepare_ptq_model(self, model: nn.Module) -> nn.Module:
+        return model
+
+    def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
+        return model
 
     def measure_model_size(self, model: nn.Module, bit_width: int = 32) -> int:
         total_params = 0

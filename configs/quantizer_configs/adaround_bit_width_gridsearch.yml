@@ -2,4 +2,9 @@ quantizer:
   bit_width: [2, 4, 8, 16]
   per_channel: True
 
-
+quantizer_optimizer:
+  num_iterations: 1000
+  batch_size: 32
+  lr: 0.001
+  lambda_reg: 0.01
+  max_samples: 1024

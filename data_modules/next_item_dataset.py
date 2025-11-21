@@ -4,7 +4,7 @@ from typing import List, Tuple, Optional
 import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from datasets._base import BaseDataset
+from data_modules._base import BaseDataset
 from types import SimpleNamespace
 
 
@@ -60,3 +60,5 @@ class NextItemDataset(BaseDataset):
         batch_idx = torch.arange(padded.size(0), device=padded.device)
         targets = padded[batch_idx, lengths - 1]
         return inputs, input_lengths, targets
+
+
