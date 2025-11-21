@@ -25,9 +25,9 @@ from models.simple_cnn import SimpleCNN
 from models.lstm import LSTMModel
 
 # Import datasets
-from datasets.next_item_dataset import NextItemDataset
-from datasets.mnist_dataset import MNISTDataset
-from datasets.imdb_dataset import IMDBDataset
+from data_modules.next_item_dataset import NextItemDataset
+from data_modules.mnist_dataset import MNISTDataset
+from data_modules.imdb_dataset import IMDBDataset
 
 # Import quantizers for PTQ
 from quantizers.no_quant import NoQuantizer
@@ -180,8 +180,14 @@ def load_model_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[n
     else:
         raise ValueError(f"Unsupported model: {model_name}")
     
-    # Apply quantization structure if needed (to match saved state_dict)
-    if quantizer_name != "no_quant":
+    # Check if model was saved with quantized layers or after prepare_for_inference
+    # by inspecting the keys in state_dict
+    state_dict_keys = list(checkpoint['model_state_dict'].keys())
+    has_quantized_layers = any('weight_quant' in key or '.emb.' in key or '.fc.' in key or '.conv.' in key 
+                                for key in state_dict_keys)
+    
+    # Apply quantization structure only if model was saved with quantized layers
+    if quantizer_name != "no_quant" and has_quantized_layers:
         try:
             quantizer_class = quantizer_name_to_quantizer_class.get(quantizer_name)
             if quantizer_class is not None:
@@ -191,23 +197,23 @@ def load_model_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[n
                 if quantizer_name == "lsq":
                     from quantizers.lsq import LSQQuantizerWrapper
                     wrapper = LSQQuantizerWrapper(quantizer_obj)
-                    model = wrapper.prepare_model(model)
+                    model = wrapper.prepare_qat_model(model)
                 elif quantizer_name == "adaround":
                     from quantizers.adaround import AdaRoundQuantizerWrapper
                     bit_width = quantizer_cfg.get('bit_width', 4)
                     wrapper = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width)
-                    model = wrapper.prepare_model(model)
+                    model = wrapper.prepare_ptq_model(model)  # AdaRound is PTQ
                 elif quantizer_name == "apot":
                     from quantizers.apot import APoTQuantizerWrapper
                     k = quantizer_cfg.get('k', 2)
                     wrapper = APoTQuantizerWrapper(quantizer_obj, k=k)
-                    model = wrapper.prepare_model(model)
+                    model = wrapper.prepare_qat_model(model)
                 elif quantizer_name == "qil":
                     from quantizers.qil import QILQuantizerWrapper
                     gamma_weight = quantizer_cfg.get('gamma_weight', None)
                     skip_first_last = quantizer_cfg.get('skip_first_last', True)
                     wrapper = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
-                    model = wrapper.prepare_model(model)
+                    model = wrapper.prepare_qat_model(model)
         except Exception as e:
             print(f"Warning: Could not prepare quantized model structure: {e}")
     
