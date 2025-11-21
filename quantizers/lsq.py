@@ -325,5 +325,109 @@ class LSQQuantizerWrapper(BaseQuantizerWrapper):
                 self.prepare_qat_model(module)
         return model
 
+    def prepare_for_inference(self, model: nn.Module, **kwargs) -> nn.Module:
+        """Convert LSQ quantized layers to standard layers with quantized weights"""
+        print("Converting LSQ model to inference mode...")
+        
+        def convert_module(module):
+            for name, child in list(module.named_children()):
+                if isinstance(child, LSQConv2d):
+                    # Quantize weights once
+                    with torch.no_grad():
+                        q_weight = child.weight_quant(child.conv.weight)
+                        q_bias = None
+                        if child.conv.bias is not None:
+                            q_bias = child.bias_quant(child.conv.bias)
+                    
+                    # Create standard Conv2d with quantized weights
+                    new_layer = nn.Conv2d(
+                        in_channels=child.conv.in_channels,
+                        out_channels=child.conv.out_channels,
+                        kernel_size=child.conv.kernel_size,
+                        stride=child.conv.stride,
+                        padding=child.conv.padding,
+                        dilation=child.conv.dilation,
+                        groups=child.conv.groups,
+                        bias=child.conv.bias is not None
+                    )
+                    new_layer.weight.data = q_weight
+                    if q_bias is not None:
+                        new_layer.bias.data = q_bias
+                    
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQLinear):
+                    # Quantize weights once
+                    with torch.no_grad():
+                        q_weight = child.weight_quant(child.fc.weight)
+                        q_bias = None
+                        if child.fc.bias is not None:
+                            q_bias = child.bias_quant(child.fc.bias)
+                    
+                    # Create standard Linear with quantized weights
+                    new_layer = nn.Linear(
+                        in_features=child.fc.in_features,
+                        out_features=child.fc.out_features,
+                        bias=child.fc.bias is not None
+                    )
+                    new_layer.weight.data = q_weight
+                    if q_bias is not None:
+                        new_layer.bias.data = q_bias
+                    
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQEmbedding):
+                    # Quantize embedding weights once
+                    with torch.no_grad():
+                        q_weight = child.weight_quant(child.emb.weight)
+                    
+                    # Create standard Embedding with quantized weights
+                    new_layer = nn.Embedding(
+                        num_embeddings=child.emb.num_embeddings,
+                        embedding_dim=child.emb.embedding_dim,
+                        padding_idx=child.emb.padding_idx,
+                        max_norm=child.emb.max_norm,
+                        norm_type=child.emb.norm_type,
+                        scale_grad_by_freq=child.emb.scale_grad_by_freq,
+                        sparse=child.emb.sparse
+                    )
+                    new_layer.weight.data = q_weight
+                    
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQLayerNorm):
+                    # Quantize LayerNorm parameters once
+                    with torch.no_grad():
+                        q_weight = child.ln.weight
+                        q_bias = child.ln.bias
+                        if q_weight is not None:
+                            q_weight = child.weight_quant(q_weight)
+                        if q_bias is not None:
+                            q_bias = child.bias_quant(q_bias)
+                    
+                    # Create standard LayerNorm with quantized parameters
+                    new_layer = nn.LayerNorm(
+                        normalized_shape=child.ln.normalized_shape,
+                        eps=child.ln.eps
+                    )
+                    if q_weight is not None:
+                        new_layer.weight.data = q_weight
+                    if q_bias is not None:
+                        new_layer.bias.data = q_bias
+                    
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQMultiheadAttention):
+                    # For MultiheadAttention, keep the quantized version for now
+                    # (complex to convert fully)
+                    pass
+                    
+                else:
+                    convert_module(child)
+        
+        convert_module(model)
+        model.eval()
+        return model
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x

@@ -31,3 +31,6 @@ dependencies:
   - mlflow
   - git
   - tmux
+  - onnx
+  - onnxscript
+  - onnxruntime
