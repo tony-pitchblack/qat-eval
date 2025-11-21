@@ -271,7 +271,7 @@ def _evaluate_sampled_sasrec(
     n = 0
     with torch.no_grad():
         batch_idx = 0
-        for batch in loader:
+        for batch in tqdm(loader, desc="eval", leave=False):
             inp = batch["masked_input"].to(device)
             attn = batch["attention_mask"].to(device)
             pos = batch["positional_ids"].to(device)
@@ -764,6 +764,7 @@ def main():
                         )
                         log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
 
+                        print(f"[epoch {ep+1}] running sampled train ranking eval...")
                         train_rank_metrics = _evaluate_sampled_sasrec(
                             model=model_obj,
                             sequences=sequences_train,
@@ -780,6 +781,7 @@ def main():
                         )
                         val_rank_metrics: Dict[str, float] = {}
                         if sequences_val:
+                            print(f"[epoch {ep+1}] running sampled val ranking eval...")
                             val_rank_metrics = _evaluate_sampled_sasrec(
                                 model=model_obj,
                                 sequences=sequences_val,
@@ -836,6 +838,7 @@ def main():
                         grad_clip=float(grad_clip) if grad_clip is not None else None,
                         quantizer_module=quantizer_module,
                     )
+                    print(f"[epoch {ep+1}] running sampled train ranking eval...")
                     train_rank_metrics = _evaluate_sampled_sasrec(
                         model=model_obj,
                         sequences=sequences_train,
@@ -852,6 +855,7 @@ def main():
                     )
                     val_rank_metrics: Dict[str, float] = {}
                     if sequences_val:
+                        print(f"[epoch {ep+1}] running sampled val ranking eval...")
                         val_rank_metrics = _evaluate_sampled_sasrec(
                             model=model_obj,
                             sequences=sequences_val,
