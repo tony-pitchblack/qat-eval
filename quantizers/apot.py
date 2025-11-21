@@ -54,7 +54,7 @@ class RCFFunction(torch.autograd.Function):
         grad_alpha_inside = (x_proj_normalized - x_normalized) * (~outlier_mask).float()
         
         grad_alpha = (grad_alpha_outlier + grad_alpha_inside) * grad_output
-        grad_alpha = grad_alpha.sum()
+        grad_alpha = grad_alpha.sum().view(alpha.shape)
         
         return grad_x, grad_alpha, None, None, None
 
