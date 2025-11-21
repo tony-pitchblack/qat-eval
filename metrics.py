@@ -31,8 +31,21 @@ def psnr(*args, **kwargs):
     raise NotImplementedError
 
 
-def rocauc(*args, **kwargs):
-    raise NotImplementedError
+def rocauc(preds, targets):
+    """Compute ROC AUC score for binary classification."""
+    try:
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        raise ImportError("sklearn is required for ROC AUC computation. Install with: pip install scikit-learn")
+
+    # Convert logits to probabilities
+    if preds.dim() > 1 and preds.size(1) > 1:
+        probs = torch.softmax(preds, dim=1)[:, 1].detach().cpu().numpy()
+    else:
+        probs = torch.sigmoid(preds.squeeze()).detach().cpu().numpy()
+
+    targets_np = targets.detach().cpu().numpy()
+    return roc_auc_score(targets_np, probs)
 
 
 MetricFn = Callable[[torch.Tensor, torch.Tensor], float]
@@ -49,5 +62,8 @@ model_name_to_metrics: Dict[str, List[Tuple[str, MetricFn]]] = {
     ],
     "simple_cnn": [
         ("accuracy", accuracy),
+    ],
+    "lstm": [
+        ("ROCAUC", rocauc),
     ],
 }

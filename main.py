@@ -26,7 +26,7 @@ from metrics import model_name_to_metrics
 from datasets.masked_seq_dataset import MaskedSeqDataset, load_tifuknn_dfs, build_sequences_from_df, get_tifuknn_paths
 
 from models.lstm import LSTMModel
-from datasets.dummy_lstm_dataset import DummyLSTMDataset
+from datasets.imdb_dataset import IMDBDataset
 
 from models.espcn import ESPCNModel
 from datasets.dummy_espcn_dataset import DummyESPCNDataset
@@ -43,10 +43,10 @@ model_name_to_model_dataset_class = {
         "model_class": SimpleCNN,
         "dataset_class": MNISTDataset,
     },
-    # "lstm": {
-    #     "model_class": LSTMModel,
-    #     "dataset_class": DummyLSTMDataset
-    # },
+    "lstm": {
+        "model_class": LSTMModel,
+        "dataset_class": IMDBDataset
+    },
     # "espcn": {
     #     "model_class": ESPCNModel,
     #     "dataset_class": DummyESPCNDataset
@@ -65,9 +65,9 @@ quantizer_name_to_quantizer_class = {
     "no_quant": NoQuantizer,
     "lsq": LSQQuantizer,
     # "pact": PACTQuantizer,
-    # "adaround": AdaRoundQuantizer,
-    # "apot": APoTQuantizer,
-    # "qil": QILQuantizer,
+    "adaround": AdaRoundQuantizer,
+    "apot": APoTQuantizer,
+    "qil": QILQuantizer,
 }
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -558,6 +558,109 @@ def fit_simple_cnn(
         print(f"\nEpoch {epoch+1}/{epochs}\n{header}\n{loss_row}\n{metric_row}")
 
 
+def fit_lstm(
+    model: LSTMModel,
+    quantizer_module: torch.nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    train_cfg: Dict[str, Any],
+    metric_fn,
+    metric_name: str,
+    device: torch.device,
+    logging_backend: str = "none",
+    mlflow_client=None,
+) -> None:
+    lr = float(train_cfg.get("lr", 1e-3))
+    weight_decay = float(train_cfg.get("weight_decay", 0.0))
+    epochs = int(train_cfg.get("epochs", 1))
+
+    use_mlflow = logging_backend == "mlflow" and mlflow_client is not None
+
+    model = model.to(device)
+    quantizer_module = quantizer_module.to(device)
+    if isinstance(quantizer_module, LSQQuantizerWrapper):
+        model = quantizer_module.prepare_model(model).to(device)
+
+    def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
+        return quantizer_module(x)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    best_train_metric = float("-inf")
+    best_val_metric = float("-inf")
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_all_logits = []
+        train_all_targets = []
+        train_count = 0
+        for inputs, lengths, targets in tqdm(train_loader, desc=f"Train {epoch+1}/{epochs}"):
+            inputs = inputs.to(device)
+            lengths = lengths.to(device)
+            targets = targets.to(device)
+            logits = model(inputs, lengths)
+            logits = apply_quantizer(logits)
+            loss = criterion(logits, targets)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            batch_size = targets.size(0)
+            train_loss_sum += loss.item() * batch_size
+            train_all_logits.append(logits.detach())
+            train_all_targets.append(targets)
+            train_count += batch_size
+
+        val_loss_avg = 0.0
+        val_metric_avg = 0.0
+        if val_loader is not None:
+            model.eval()
+            val_loss_sum = 0.0
+            val_all_logits = []
+            val_all_targets = []
+            val_count = 0
+            with torch.no_grad():
+                for inputs, lengths, targets in tqdm(val_loader, desc=f"Valid {epoch+1}/{epochs}"):
+                    inputs = inputs.to(device)
+                    lengths = lengths.to(device)
+                    targets = targets.to(device)
+                    logits = model(inputs, lengths)
+                    logits = apply_quantizer(logits)
+                    loss = criterion(logits, targets)
+                    batch_size = targets.size(0)
+                    val_loss_sum += loss.item() * batch_size
+                    val_all_logits.append(logits)
+                    val_all_targets.append(targets)
+                    val_count += batch_size
+            val_loss_avg = (val_loss_sum / max(1, val_count)) if val_count > 0 else 0.0
+            if val_all_logits:
+                val_all_logits_cat = torch.cat(val_all_logits, dim=0)
+                val_all_targets_cat = torch.cat(val_all_targets, dim=0)
+                val_metric_avg = metric_fn(val_all_logits_cat, val_all_targets_cat)
+
+        train_loss_avg = (train_loss_sum / max(1, train_count)) if train_count > 0 else 0.0
+        train_metric_avg = 0.0
+        if train_all_logits:
+            train_all_logits_cat = torch.cat(train_all_logits, dim=0)
+            train_all_targets_cat = torch.cat(train_all_targets, dim=0)
+            train_metric_avg = metric_fn(train_all_logits_cat, train_all_targets_cat)
+        best_train_metric = max(best_train_metric, train_metric_avg)
+        best_val_metric = max(best_val_metric, val_metric_avg)
+        if use_mlflow:
+            mlflow_client.log_metric("train_loss", train_loss_avg, step=epoch + 1)
+            mlflow_client.log_metric(f"train_{metric_name}", train_metric_avg, step=epoch + 1)
+            mlflow_client.log_metric("val_loss", val_loss_avg, step=epoch + 1)
+            mlflow_client.log_metric(f"val_{metric_name}", val_metric_avg, step=epoch + 1)
+            mlflow_client.log_metric(f"max_train_{metric_name}", best_train_metric, step=epoch + 1)
+            mlflow_client.log_metric(f"max_val_{metric_name}", best_val_metric, step=epoch + 1)
+
+        header = f"{'':12}{'Train':>12}{'Val':>12}"
+        loss_row = f"{'Loss':12}{train_loss_avg:12.4f}{val_loss_avg:12.4f}"
+        metric_row = f"{metric_name:12}{train_metric_avg:12.4f}{val_metric_avg:12.4f}"
+        print(f"\nEpoch {epoch+1}/{epochs}\n{header}\n{loss_row}\n{metric_row}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, choices=["sasrec", "simple_cnn", "espcn", "lstm"])
@@ -996,6 +1099,117 @@ def main():
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
             else:
                 fit_simple_cnn(
+                    model_obj,
+                    quantizer_obj,
+                    train_loader,
+                    val_loader,
+                    train_cfg,
+                    metric_fn,
+                    metric_name,
+                    device,
+                )
+                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+    elif args.model == "lstm":
+        metrics_cfg = model_name_to_metrics.get(args.model)
+        if not metrics_cfg:
+            raise ValueError(f"No metric mapping found for model '{args.model}'")
+        metric_name, metric_fn = metrics_cfg[0]
+        for cfg in grid_cfgs:
+            model_cfg = cfg.get("model", {})
+            dataset_cfg = cfg.get("dataset", {})
+            train_cfg = cfg.get("training", {})
+            quantizer_cfg = cfg.get("quantizer", {})
+
+            train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
+            val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
+
+            inferred = getattr(train_ds, "inferred_params", None)
+            if inferred is None:
+                raise ValueError("Dataset does not expose inferred_params needed for model construction")
+            if isinstance(inferred, dict):
+                inferred_dict = inferred
+            else:
+                inferred_dict = getattr(inferred, "__dict__", {}) or {}
+            vocab_size = int(inferred_dict.get("vocab_size", 0))
+            num_classes = int(inferred_dict.get("num_classes", 0))
+            if vocab_size <= 0:
+                raise ValueError("Failed to infer a positive vocab_size from inferred_params")
+            if num_classes <= 0:
+                raise ValueError("Failed to infer a positive num_classes from inferred_params")
+            inferred_dict = {**inferred_dict, "vocab_size": vocab_size, "num_classes": num_classes}
+            model_obj = model_cls(**{**model_cfg, **inferred_dict})
+
+            batch_size = int(train_cfg["batch_size"])
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=dataset_cls.collate_fn,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=dataset_cls.collate_fn,
+            )
+
+            quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
+            if quantizer_cls is None:
+                raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
+            quantizer_obj = quantizer_cls(**quantizer_cfg)
+            if isinstance(quantizer_obj, LSQQuantizer):
+                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+
+            bit_width = getattr(quantizer_obj, "bit_width", None)
+            if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
+                bit_width = getattr(quantizer_obj._quantizer, "bit_width", None)
+            if bit_width is not None:
+                print(f"Using quantization bit width: {bit_width}")
+            else:
+                print("No quantization is used")
+
+            if mlflow_client is not None:
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
+                }
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                with mlflow_client.start_run(run_name=run_name):
+                    all_params: Dict[str, Any] = {
+                        "model_name": args.model,
+                        "quantizer_name": args.quantizer,
+                        "batch_size": int(train_cfg.get("batch_size", 0)),
+                    }
+                    for section_name, section_cfg in [
+                        ("model", model_cfg),
+                        ("dataset", dataset_cfg),
+                        ("training", train_cfg),
+                        ("quantizer", quantizer_cfg),
+                    ]:
+                        for k, v in section_cfg.items():
+                            all_params[f"{section_name}.{k}"] = v
+                    mlflow_client.log_params(all_params)
+                    fit_lstm(
+                        model_obj,
+                        quantizer_obj,
+                        train_loader,
+                        val_loader,
+                        train_cfg,
+                        metric_fn,
+                        metric_name,
+                        device,
+                        logging_backend="mlflow",
+                        mlflow_client=mlflow_client,
+                    )
+                    model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+            else:
+                fit_lstm(
                     model_obj,
                     quantizer_obj,
                     train_loader,

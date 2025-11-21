@@ -145,3 +145,4 @@ Thumbs.db
 # MacOS specific
 .DS_Store
 __MACOSX
+qat-eval-venv/*
