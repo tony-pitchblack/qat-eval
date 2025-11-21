@@ -57,9 +57,9 @@ model_name_to_model_dataset_class = {
 from quantizers.no_quant import NoQuantizer
 from quantizers.lsq import LSQQuantizer, LSQQuantizerWrapper
 from quantizers.pact import PACTQuantizer
-from quantizers.adaround import AdaRoundQuantizer
-from quantizers.apot import APoTQuantizer
-from quantizers.qil import QILQuantizer
+from quantizers.adaround import AdaRoundQuantizer, AdaRoundQuantizerWrapper
+from quantizers.apot import APoTQuantizer, APoTQuantizerWrapper
+from quantizers.qil import QILQuantizer, QILQuantizerWrapper
 
 quantizer_name_to_quantizer_class = {
     "no_quant": NoQuantizer,
@@ -397,7 +397,7 @@ def fit_sasrec(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, LSQQuantizerWrapper):
+    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
         model = quantizer_module.prepare_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
@@ -488,7 +488,7 @@ def fit_simple_cnn(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, LSQQuantizerWrapper):
+    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
         model = quantizer_module.prepare_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
@@ -578,7 +578,7 @@ def fit_lstm(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, LSQQuantizerWrapper):
+    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
         model = quantizer_module.prepare_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
@@ -803,6 +803,16 @@ def main():
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+            elif isinstance(quantizer_obj, AdaRoundQuantizer):
+                bit_width_q = quantizer_obj.bit_width
+                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+            elif isinstance(quantizer_obj, APoTQuantizer):
+                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
+                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+            elif isinstance(quantizer_obj, QILQuantizer):
+                gamma_weight = quantizer_cfg.get('gamma_weight', None)
+                skip_first_last = quantizer_cfg.get('skip_first_last', True)
+                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
             if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
@@ -813,7 +823,7 @@ def main():
                 print("No quantization is used")
 
             quantizer_module: torch.nn.Module = quantizer_obj
-            if isinstance(quantizer_module, LSQQuantizerWrapper):
+            if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
                 model_obj = quantizer_module.prepare_model(model_obj).to(device)
             else:
                 model_obj = model_obj.to(device)
@@ -1044,6 +1054,16 @@ def main():
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+            elif isinstance(quantizer_obj, AdaRoundQuantizer):
+                bit_width_q = quantizer_obj.bit_width
+                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+            elif isinstance(quantizer_obj, APoTQuantizer):
+                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
+                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+            elif isinstance(quantizer_obj, QILQuantizer):
+                gamma_weight = quantizer_cfg.get('gamma_weight', None)
+                skip_first_last = quantizer_cfg.get('skip_first_last', True)
+                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
             if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
@@ -1159,6 +1179,16 @@ def main():
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+            elif isinstance(quantizer_obj, AdaRoundQuantizer):
+                bit_width_q = quantizer_obj.bit_width
+                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+            elif isinstance(quantizer_obj, APoTQuantizer):
+                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
+                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+            elif isinstance(quantizer_obj, QILQuantizer):
+                gamma_weight = quantizer_cfg.get('gamma_weight', None)
+                skip_first_last = quantizer_cfg.get('skip_first_last', True)
+                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
             if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
