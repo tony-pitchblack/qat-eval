@@ -17,6 +17,7 @@ class LSQQuantizer(BaseQuantizer):
     def init_from(self, x: torch.Tensor) -> None:
         with torch.no_grad():
             s = (x.max() - x.min()) / (self.thd_pos - self.thd_neg)
+            s = torch.clamp(s, min=1e-4)
             self.s.data = s.to(self.s.data.dtype)
 
     def skip_grad_scale(self, x: torch.Tensor, scale: float) -> torch.Tensor:

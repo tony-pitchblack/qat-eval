@@ -3,26 +3,27 @@
 # Basic imports
 import argparse
 import warnings
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List, Optional
 import hashlib
 import json
+import os
+
+import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader
-import os
 from tqdm.auto import tqdm
-from functools import partial
 from itertools import product
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Import models & datasets
 from models.sasrec import SASRecModel
 from datasets.next_item_dataset import NextItemDataset
 from models.simple_cnn import SimpleCNN
 from datasets.mnist_dataset import MNISTDataset
-from metrics import ndcg_at_k, accuracy
+from metrics import model_name_to_metrics
+from datasets.masked_seq_dataset import MaskedSeqDataset, load_tifuknn_dfs, build_sequences_from_df, get_tifuknn_paths
 
 from models.lstm import LSTMModel
 from datasets.dummy_lstm_dataset import DummyLSTMDataset
@@ -60,7 +61,6 @@ from quantizers.adaround import AdaRoundQuantizer
 from quantizers.apot import APoTQuantizer
 from quantizers.qil import QILQuantizer
 
-# Uncomment quantizers as they get implemented
 quantizer_name_to_quantizer_class = {
     "no_quant": NoQuantizer,
     "lsq": LSQQuantizer,
@@ -68,23 +68,6 @@ quantizer_name_to_quantizer_class = {
     # "adaround": AdaRoundQuantizer,
     # "apot": APoTQuantizer,
     # "qil": QILQuantizer,
-}
-
-model_name_to_metric = {
-    "sasrec": {
-        "metric_name": f"NDCG_at_{10}",
-        "metric_fn": partial(ndcg_at_k, k=10),
-    },
-
-    # "lstm": {
-    #     "metric_name": "ROCAUC",
-    #     "metric_fn": rocauc  # import rocauc when enabling LSTM
-    # },
-
-    # "espcn": {
-    #     "metric_name": "PSNR",
-    #     "metric_fn": psnr    # import psnr when enabling ESPCN
-    # },
 }
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -200,6 +183,200 @@ def _finalize_model_size(
     return model
 
 
+def _log_mlflow_dataset(mlflow_client, train_path: str, dataset_name: str) -> None:
+    try:
+        import mlflow.data as mlfd  # type: ignore[import]
+        abs_src = os.path.abspath(train_path)
+        try:
+            from mlflow.data.dataset_source import LocalArtifactDatasetSource  # type: ignore[import]
+
+            src_obj = LocalArtifactDatasetSource(abs_src)
+            ds_obj = mlfd.from_pandas(pd.DataFrame(), source=src_obj, name=str(dataset_name))
+        except Exception:
+            ds_obj = mlfd.from_pandas(pd.DataFrame(), source=abs_src, name=str(dataset_name))
+        mlflow_client.log_input(ds_obj, context="training")
+    except Exception:
+        pass
+
+def _sample_negatives(
+    true_ids: torch.Tensor,
+    max_item_id: int,
+    k: int,
+) -> torch.Tensor:
+    m = true_ids.size(0)
+    device = true_ids.device
+    neg = torch.randint(low=1, high=max_item_id + 1, size=(m, k), device=device)
+    true_exp = true_ids.unsqueeze(1).expand_as(neg)
+    mask = neg.eq(true_exp)
+    while mask.any():
+        neg[mask] = torch.randint(low=1, high=max_item_id + 1, size=(mask.sum().item(),), device=device)
+        mask = neg.eq(true_exp)
+    return neg
+
+
+def _generate_subsequent_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    return torch.triu(torch.ones((seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1)
+
+
+def _encode_masked_sequences(
+    model: SASRecModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    positional_ids: torch.Tensor,
+) -> torch.Tensor:
+    device = input_ids.device
+    x = model.item_embedding(input_ids)
+    pos_emb = model.positional_embedding(positional_ids)
+    x = x + pos_emb
+    x = model.embedding_dropout(x)
+    key_padding_mask = attention_mask == 0
+    seq_len = x.size(1)
+    attn_mask = _generate_subsequent_mask(seq_len, device=device)
+    h = model.encoder(x, mask=attn_mask, src_key_padding_mask=key_padding_mask)
+    h = model.final_norm(h)
+    return h
+
+
+def _evaluate_sampled_sasrec(
+    model: SASRecModel,
+    sequences: List[List[int]],
+    max_seq_len: int,
+    min_seq_len: int,
+    pad_token_id: int,
+    mask_token_id: int,
+    max_item_id: int,
+    device: torch.device,
+    ks=(5, 10, 20),
+    sampled_neg_k: int = 1000,
+    batch_size: int = 512,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    model.eval()
+    ds = MaskedSeqDataset(
+        sequences=sequences,
+        max_seq_len=max_seq_len,
+        min_seq_len=min_seq_len,
+        pad_token_id=pad_token_id,
+        mask_token_id=mask_token_id,
+    )
+    if len(ds) == 0:
+        return {f"HR_at_{k}": float("nan") for k in ks} | {
+            f"NDCG_at_{k}": float("nan") for k in ks
+        } | {f"MRR_at_{max(ks)}": float("nan")}
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=MaskedSeqDataset.collate_fn)
+    max_k = max(ks)
+    metrics: Dict[str, float] = {f"HR_at_{k}": 0.0 for k in ks}
+    metrics.update({f"NDCG_at_{k}": 0.0 for k in ks})
+    mrr_total = 0.0
+    n = 0
+    loss_sum = 0.0
+    with torch.no_grad():
+        batch_idx = 0
+        for batch in tqdm(loader, desc="eval", leave=False):
+            inp = batch["masked_input"].to(device)
+            attn = batch["attention_mask"].to(device)
+            pos = batch["positional_ids"].to(device)
+            targets = batch["target_id"].to(device)
+            mask_index = batch["mask_index"].to(device)
+            h = _encode_masked_sequences(model, inp, attn, pos)
+            b, l, e = h.shape
+            preds = h[torch.arange(b, device=device), mask_index]
+            neg = _sample_negatives(targets, max_item_id=max_item_id, k=sampled_neg_k)
+            neg = neg.to(device)
+            cand = torch.cat([targets.unsqueeze(1), neg], dim=1)
+            cand_emb = model.item_embedding(cand)
+            scores = (cand_emb * preds.unsqueeze(1)).sum(-1)
+            probas = torch.softmax(scores, dim=-1)
+            loss_batch = -torch.log(probas[:, 0] + 1e-12).mean().item()
+            loss_sum += loss_batch * b
+            topk_idx = scores.topk(max_k, dim=1).indices
+            hit_matrix = topk_idx == 0
+            hit_any = hit_matrix.any(dim=1)
+            hit_pos = torch.argmax(hit_matrix.int(), dim=1)
+            mrr_total += (hit_any * (1.0 / (hit_pos + 1).float())).sum().item()
+            for k in ks:
+                hk = hit_matrix[:, :k].any(dim=1).float()
+                metrics[f"HR_at_{k}"] += hk.sum().item()
+                idx_or_neg1 = torch.where(
+                    hit_matrix[:, :k],
+                    torch.arange(k, device=device).unsqueeze(0).expand(b, k),
+                    torch.full((b, k), -1, device=device),
+                )
+                pos_true = idx_or_neg1.max(dim=1).values
+                mask_valid = pos_true >= 0
+                ndcg = torch.zeros(b, device=device)
+                ndcg[mask_valid] = 1.0 / torch.log2(pos_true[mask_valid].float() + 2.0)
+                metrics[f"NDCG_at_{k}"] += ndcg.sum().item()
+            n += b
+            batch_idx += 1
+            if max_batches is not None and batch_idx >= int(max_batches):
+                break
+    if n == 0:
+        return {
+            **{f"HR_at_{k}": float("nan") for k in ks},
+            **{f"NDCG_at_{k}": float("nan") for k in ks},
+            f"MRR_at_{max(ks)}": float("nan"),
+            "loss": float("nan"),
+        }
+    out: Dict[str, float] = {k: (metrics[k] / n) for k in metrics}
+    out[f"MRR_at_{max(ks)}"] = mrr_total / n
+    out["loss"] = loss_sum / n
+    return out
+
+
+def _train_one_epoch_sasrec_masked(
+    model: SASRecModel,
+    loader: DataLoader,
+    max_item_id: int,
+    neg_k: int,
+    device: torch.device,
+    grad_clip: Optional[float],
+    quantizer_module: Optional[torch.nn.Module] = None,
+) -> float:
+    model.train()
+    opt = torch.optim.AdamW(model.parameters())
+    running = 0.0
+    steps = 0
+
+    def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
+        if quantizer_module is None:
+            return x
+        return quantizer_module(x)
+
+    pbar = tqdm(loader, desc="train", leave=False)
+    for batch in pbar:
+        input_ids = batch["masked_input"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        positional_ids = batch["positional_ids"].to(device)
+        true_ids = batch["target_id"].to(device)
+        mask_index = batch["mask_index"].to(device)
+        h = _encode_masked_sequences(model, input_ids, attention_mask, positional_ids)
+        b, l, e = h.shape
+        preds = h[torch.arange(b, device=device), mask_index]
+        pos_emb = model.item_embedding(true_ids).unsqueeze(1)
+        neg_ids = _sample_negatives(true_ids, max_item_id=max_item_id, k=neg_k)
+        neg_ids = neg_ids.to(device)
+        neg_emb = model.item_embedding(neg_ids)
+        anchor = preds.unsqueeze(1)
+        all_counterparty = torch.cat([pos_emb, neg_emb], dim=1)
+        logits = (anchor * all_counterparty).sum(dim=-1)
+        logits = apply_quantizer(logits)
+        probas = torch.softmax(logits, dim=-1)
+        loss = -torch.log(probas[:, 0] + 1e-12).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        running += loss.item()
+        steps += 1
+        if steps % 100 == 0:
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{(running / steps):.4f}")
+    avg = running / max(steps, 1)
+    print(f"[train] steps={steps} avg_loss={avg:.4f}")
+    return avg
+
+
 def fit_sasrec(
     model: SASRecModel,
     quantizer_module: torch.nn.Module,
@@ -282,8 +459,8 @@ def fit_sasrec(
             mlflow_client.log_metric(f"train_{metric_name}", train_metric_avg, step=epoch + 1)
             mlflow_client.log_metric("val_loss", val_loss_avg, step=epoch + 1)
             mlflow_client.log_metric(f"val_{metric_name}", val_metric_avg, step=epoch + 1)
-            mlflow_client.log_metric(f"max_train_{metric_name}", best_train_metric, step=epoch + 1)
-            mlflow_client.log_metric(f"max_val_{metric_name}", best_val_metric, step=epoch + 1)
+            mlflow_client.log_metric(f"train_max_{metric_name}", best_train_metric, step=epoch + 1)
+            mlflow_client.log_metric(f"val_max_{metric_name}", best_val_metric, step=epoch + 1)
 
         header = f"{'':12}{'Train':>12}{'Val':>12}"
         loss_row = f"{'Loss':12}{train_loss_avg:12.4f}{val_loss_avg:12.4f}"
@@ -464,45 +641,57 @@ def main():
         mlflow_client = mlflow
 
     if args.model == "sasrec":
-        metric_cfg = model_name_to_metric.get(args.model)
-        if metric_cfg is None:
-            raise ValueError(f"No metric mapping found for model '{args.model}'")
-        metric_name = metric_cfg["metric_name"]
-        metric_fn = metric_cfg["metric_fn"]
         for cfg in grid_cfgs:
             model_cfg = cfg.get("model", {})
             dataset_cfg = cfg.get("dataset", {})
             train_cfg = cfg.get("training", {})
             quantizer_cfg = cfg.get("quantizer", {})
 
-            train_ds = dataset_cls(**{**dataset_cfg, "split": "train"})
-            val_ds = dataset_cls(**{**dataset_cfg, "split": "val"})
+            root_dir = str(dataset_cfg.get("root_dir", os.path.join("external_repos", "TIFUKNN", "data")))
+            dataset_name = str(dataset_cfg.get("dataset", "Dunnhumby"))
+            min_len = int(dataset_cfg.get("min_len", 2))
+            max_seq_len = int(model_cfg.get("max_seq_len", 10))
+            neg_k = int(train_cfg.get("neg_k", 50))
+            grad_clip = train_cfg.get("grad_clip", 1.0)
 
-            inferred = getattr(train_ds, "inferred_params", None)
-            if inferred is None:
-                raise ValueError("Dataset does not expose inferred_params needed for model construction")
-            if isinstance(inferred, dict):
-                inferred_dict = inferred
-            else:
-                inferred_dict = getattr(inferred, "__dict__", {}) or {}
-            num_items = int(inferred_dict.get("num_items", 0))
-            if num_items <= 0:
-                raise ValueError("Failed to infer a positive num_items from inferred_params")
-            inferred_dict = {**inferred_dict, "num_items": num_items}
-            model_obj = model_cls(**{**model_cfg, **inferred_dict})
+            df_train, df_val = load_tifuknn_dfs(root_dir, dataset_name)
+            max_train = int(df_train["MATERIAL_NUMBER"].max()) if not df_train.empty else 0
+            max_val = int(df_val["MATERIAL_NUMBER"].max()) if not df_val.empty else 0
+            max_item_id = max(max_train, max_val)
+            if max_item_id <= 0:
+                raise ValueError("Failed to infer a positive max_item_id from data")
+            mask_token_id = max_item_id + 1
+
+            sequences_train = build_sequences_from_df(df_train, min_seq_len=min_len, max_seq_len=max_seq_len)
+            sequences_val = build_sequences_from_df(df_val, min_seq_len=min_len, max_seq_len=max_seq_len)
+
+            pad_token_id = int(model_cfg.get("pad_token_id", 0))
+            model_obj = model_cls(
+                num_items=mask_token_id,
+                max_seq_len=max_seq_len,
+                hidden_size=int(model_cfg.get("hidden_size", 64)),
+                num_heads=int(model_cfg.get("num_heads", 1)),
+                num_layers=int(model_cfg.get("num_layers", 1)),
+                dropout=float(model_cfg.get("dropout", 0.1)),
+                pad_token_id=pad_token_id,
+                device=device,
+            )
 
             batch_size = int(train_cfg["batch_size"])
+            train_ds = MaskedSeqDataset(
+                sequences=sequences_train,
+                max_seq_len=max_seq_len,
+                min_seq_len=min_len,
+                pad_token_id=pad_token_id,
+                mask_token_id=mask_token_id,
+            )
             train_loader = DataLoader(
                 train_ds,
                 batch_size=batch_size,
                 shuffle=True,
-                collate_fn=dataset_cls.collate_fn,
-            )
-            val_loader = DataLoader(
-                val_ds,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=dataset_cls.collate_fn,
+                num_workers=0,
+                collate_fn=MaskedSeqDataset.collate_fn,
+                drop_last=True,
             )
 
             quantizer_cls = quantizer_name_to_quantizer_class.get(args.quantizer)
@@ -520,6 +709,12 @@ def main():
             else:
                 print("No quantization is used")
 
+            quantizer_module: torch.nn.Module = quantizer_obj
+            if isinstance(quantizer_module, LSQQuantizerWrapper):
+                model_obj = quantizer_module.prepare_model(model_obj).to(device)
+            else:
+                model_obj = model_obj.to(device)
+
             if mlflow_client is not None:
                 run_config = {
                     "model": args.model,
@@ -531,7 +726,11 @@ def main():
                 }
                 config_str = json.dumps(run_config, sort_keys=True, default=str)
                 hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
                 with mlflow_client.start_run(run_name=run_name):
                     all_params: Dict[str, Any] = {
                         "model_name": args.model,
@@ -547,34 +746,170 @@ def main():
                         for k, v in section_cfg.items():
                             all_params[f"{section_name}.{k}"] = v
                     mlflow_client.log_params(all_params)
-                    fit_sasrec(
-                        model_obj,
-                        quantizer_obj,
-                        train_loader,
-                        val_loader,
-                        train_cfg,
-                        metric_fn,
-                        metric_name,
-                        device,
-                        logging_backend="mlflow",
-                        mlflow_client=mlflow_client,
-                    )
+
+                    if dataset_for_run:
+                        train_path, _ = get_tifuknn_paths(root_dir, dataset_for_run)
+                        try:
+                            mlflow_client.set_tag("Dataset", str(dataset_for_run))
+                        except Exception:
+                            pass
+                        _log_mlflow_dataset(mlflow_client, train_path, str(dataset_for_run))
+
+                    sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
+                    best_train_metrics: Dict[str, float] = {}
+                    best_val_metrics: Dict[str, float] = {}
+
+                    total_epochs = int(train_cfg.get("epochs", 1))
+                    for ep in range(total_epochs):
+                        avg_loss = _train_one_epoch_sasrec_masked(
+                            model=model_obj,
+                            loader=train_loader,
+                            max_item_id=max_item_id,
+                            neg_k=neg_k,
+                            device=device,
+                            grad_clip=float(grad_clip) if grad_clip is not None else None,
+                            quantizer_module=quantizer_module,
+                        )
+                        log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
+
+                        print(f"[epoch {ep+1}] running sampled train ranking eval...")
+                        train_rank_metrics = _evaluate_sampled_sasrec(
+                            model=model_obj,
+                            sequences=sequences_train,
+                            max_seq_len=max_seq_len,
+                            min_seq_len=min_len,
+                            pad_token_id=pad_token_id,
+                            mask_token_id=mask_token_id,
+                            max_item_id=max_item_id,
+                            device=device,
+                            ks=(5, 10, 20),
+                            sampled_neg_k=1000,
+                            batch_size=512,
+                            max_batches=None,
+                        )
+                        val_rank_metrics: Dict[str, float] = {}
+                        if sequences_val:
+                            print(f"[epoch {ep+1}] running sampled val ranking eval...")
+                            val_rank_metrics = _evaluate_sampled_sasrec(
+                                model=model_obj,
+                                sequences=sequences_val,
+                                max_seq_len=max_seq_len,
+                                min_seq_len=min_len,
+                                pad_token_id=pad_token_id,
+                                mask_token_id=mask_token_id,
+                                max_item_id=max_item_id,
+                                device=device,
+                                ks=(5, 10, 20),
+                                sampled_neg_k=1000,
+                                batch_size=512,
+                                max_batches=None,
+                            )
+
+                        val_loss = (
+                            float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
+                        )
+                        log_payload["val_loss"] = val_loss
+
+                        for metric_name, _ in sasrec_metrics_cfg:
+                            train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                            val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
+                                "nan"
+                            )
+                            prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                            prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                            best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                            best_val_metrics[metric_name] = max(prev_val_best, val_val)
+                            log_payload[f"train_{metric_name}"] = train_val
+                            log_payload[f"val_{metric_name}"] = val_val
+                            log_payload[f"train_max_{metric_name}"] = best_train_metrics[metric_name]
+                            log_payload[f"val_max_{metric_name}"] = best_val_metrics[metric_name]
+
+                        if sequences_val:
+                            metrics_str = " ".join(
+                                [f"{k}={v:.4f}" for k, v in val_rank_metrics.items()]
+                            )
+                            print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
+                        else:
+                            print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
+
+                        mlflow_client.log_metrics(log_payload, step=ep + 1)
+
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
             else:
-                fit_sasrec(
-                    model_obj,
-                    quantizer_obj,
-                    train_loader,
-                    val_loader,
-                    train_cfg,
-                    metric_fn,
-                    metric_name,
-                    device,
-                )
+                sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
+                best_train_metrics: Dict[str, float] = {}
+                best_val_metrics: Dict[str, float] = {}
+
+                total_epochs = int(train_cfg.get("epochs", 1))
+                for ep in range(total_epochs):
+                    avg_loss = _train_one_epoch_sasrec_masked(
+                        model=model_obj,
+                        loader=train_loader,
+                        max_item_id=max_item_id,
+                        neg_k=neg_k,
+                        device=device,
+                        grad_clip=float(grad_clip) if grad_clip is not None else None,
+                        quantizer_module=quantizer_module,
+                    )
+                    print(f"[epoch {ep+1}] running sampled train ranking eval...")
+                    train_rank_metrics = _evaluate_sampled_sasrec(
+                        model=model_obj,
+                        sequences=sequences_train,
+                        max_seq_len=max_seq_len,
+                        min_seq_len=min_len,
+                        pad_token_id=pad_token_id,
+                        mask_token_id=mask_token_id,
+                        max_item_id=max_item_id,
+                        device=device,
+                        ks=(5, 10, 20),
+                        sampled_neg_k=1000,
+                        batch_size=512,
+                        max_batches=None,
+                    )
+                    val_rank_metrics: Dict[str, float] = {}
+                    if sequences_val:
+                        print(f"[epoch {ep+1}] running sampled val ranking eval...")
+                        val_rank_metrics = _evaluate_sampled_sasrec(
+                            model=model_obj,
+                            sequences=sequences_val,
+                            max_seq_len=max_seq_len,
+                            min_seq_len=min_len,
+                            pad_token_id=pad_token_id,
+                            mask_token_id=mask_token_id,
+                            max_item_id=max_item_id,
+                            device=device,
+                            ks=(5, 10, 20),
+                            sampled_neg_k=1000,
+                            batch_size=512,
+                            max_batches=None,
+                        )
+
+                    val_loss = (
+                        float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
+                    )
+
+                    for metric_name, _ in sasrec_metrics_cfg:
+                        train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                        val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
+                            "nan"
+                        )
+                        prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                        prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                        best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                        best_val_metrics[metric_name] = max(prev_val_best, val_val)
+
+                    if sequences_val:
+                        metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_rank_metrics.items()])
+                        print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
+                    else:
+                        print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
+
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
-        metric_name = "accuracy"
-        metric_fn = accuracy
+        metrics_cfg = model_name_to_metrics.get(args.model)
+        if not metrics_cfg:
+            raise ValueError(f"No metric mapping found for model '{args.model}'")
+        metric_name, metric_fn = metrics_cfg[0]
         for cfg in grid_cfgs:
             model_cfg = cfg.get("model", {})
             dataset_cfg = cfg.get("dataset", {})
@@ -626,7 +961,11 @@ def main():
                 }
                 config_str = json.dumps(run_config, sort_keys=True, default=str)
                 hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
-                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
                 with mlflow_client.start_run(run_name=run_name):
                     all_params: Dict[str, Any] = {
                         "model_name": args.model,

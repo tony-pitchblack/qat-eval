@@ -1,7 +1,9 @@
 import torch
+from functools import partial
+from typing import Dict, List, Tuple, Callable
 
 
-def ndcg_at_k(preds, targets, k=10):
+def ndcg_at_k(preds: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
     topk = torch.topk(preds, k=k, dim=1).indices
     targets = targets.unsqueeze(1)
     hits = (topk == targets).float()
@@ -12,7 +14,14 @@ def ndcg_at_k(preds, targets, k=10):
     return ndcg.mean().item()
 
 
-def accuracy(preds, targets):
+def hr_at_k(preds: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
+    topk = torch.topk(preds, k=k, dim=1).indices
+    targets = targets.unsqueeze(1)
+    hits = (topk == targets).any(dim=1).float()
+    return hits.mean().item()
+
+
+def accuracy(preds: torch.Tensor, targets: torch.Tensor) -> float:
     pred_labels = preds.argmax(dim=1)
     correct = (pred_labels == targets).float().mean()
     return correct.item()
@@ -24,3 +33,21 @@ def psnr(*args, **kwargs):
 
 def rocauc(*args, **kwargs):
     raise NotImplementedError
+
+
+MetricFn = Callable[[torch.Tensor, torch.Tensor], float]
+
+
+model_name_to_metrics: Dict[str, List[Tuple[str, MetricFn]]] = {
+    "sasrec": [
+        ("NDCG_at_5", partial(ndcg_at_k, k=5)),
+        ("NDCG_at_10", partial(ndcg_at_k, k=10)),
+        ("NDCG_at_20", partial(ndcg_at_k, k=20)),
+        ("HR_at_5", partial(hr_at_k, k=5)),
+        ("HR_at_10", partial(hr_at_k, k=10)),
+        ("HR_at_20", partial(hr_at_k, k=20)),
+    ],
+    "simple_cnn": [
+        ("accuracy", accuracy),
+    ],
+}
