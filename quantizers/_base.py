@@ -34,6 +34,13 @@ class BaseQuantizerWrapper(nn.Module, ABC):
     def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
         return model
 
+    def prepare_for_inference(self, model: nn.Module, **kwargs) -> nn.Module:
+        """Prepare model for inference (PTQ calibration, layer conversion, etc.)
+        
+        Default implementation does nothing. Override in subclasses as needed.
+        """
+        return model
+
     def measure_model_size(self, model: nn.Module, bit_width: int = 32) -> int:
         total_params = 0
         for param in model.parameters():

@@ -138,6 +138,39 @@ def get_mlflow_tracking_uri(env_path: str = ".env") -> str:
     return f"http://{host}:{port}"
 
 
+def _save_model(
+    model: torch.nn.Module,
+    model_name: str,
+    quantizer_name: str,
+    config_hash: str,
+    save_dir: str = "saved_models",
+    model_cfg: Dict[str, Any] = None,
+    dataset_cfg: Dict[str, Any] = None,
+    train_cfg: Dict[str, Any] = None,
+    quantizer_cfg: Dict[str, Any] = None,
+) -> str:
+    """Save quantized model to disk"""
+    import os
+    os.makedirs(save_dir, exist_ok=True)
+
+    model_filename = f"{model_name}_{quantizer_name}_{config_hash}.pt"
+    model_path = os.path.join(save_dir, model_filename)
+
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_name': model_name,
+        'quantizer_name': quantizer_name,
+        'config_hash': config_hash,
+        'model_cfg': model_cfg or {},
+        'dataset_cfg': dataset_cfg or {},
+        'train_cfg': train_cfg or {},
+        'quantizer_cfg': quantizer_cfg or {},
+    }, model_path)
+
+    print(f"Model saved to: {model_path}")
+    return model_path
+
+
 def _finalize_model_size(
     model: torch.nn.Module,
     quantizer_module: torch.nn.Module,
@@ -1741,6 +1774,27 @@ def main():
                 )
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
                 _save_model_artifact(model_obj, mlflow_client=None, run_name=run_name)
+
+    run_config = {
+        "model": args.model,
+        "quantizer": args.quantizer,
+        "model_cfg": model_cfg,
+        "dataset_cfg": dataset_cfg,
+        "train_cfg": train_cfg,
+        "quantizer_cfg": quantizer_cfg,
+    }
+    config_str = json.dumps(run_config, sort_keys=True, default=str)
+    config_hash = hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
+    _save_model(
+        model_obj, 
+        args.model, 
+        args.quantizer, 
+        config_hash,
+        model_cfg=model_cfg,
+        dataset_cfg=dataset_cfg,
+        train_cfg=train_cfg,
+        quantizer_cfg=quantizer_cfg
+    )
 
 
 if __name__ == "__main__":

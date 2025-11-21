@@ -147,3 +147,5 @@ Thumbs.db
 .DS_Store
 __MACOSX
 qat-eval-venv/*
+saved_models/*
+benchmark_results/*

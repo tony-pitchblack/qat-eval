@@ -828,6 +828,30 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
         model.eval()
         return model
     
+    def prepare_for_inference(
+        self, 
+        model: nn.Module, 
+        dataloader: torch.utils.data.DataLoader = None,
+        num_iterations: int = 1000,
+        max_samples: int = 512,
+        device: str = 'cuda',
+        **kwargs
+    ) -> nn.Module:
+        """Prepare AdaRound model for inference by calibrating"""
+        if dataloader is None:
+            print("Warning: AdaRound requires calibration dataloader for optimal performance")
+            return model
+        
+        print("Calibrating AdaRound model for inference...")
+        model = self.calibrate_model(
+            model=model,
+            dataloader=dataloader,
+            num_iterations=num_iterations,
+            max_samples=max_samples,
+            device=device
+        )
+        return model
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
