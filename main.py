@@ -58,7 +58,7 @@ model_name_to_model_dataset_class = {
 # Import quantizers
 from quantizers.no_quant import NoQuantizer, NoQuantizerWrapper
 from quantizers.lsq import LSQQuantizer, LSQQuantizerWrapper
-from quantizers.pact import PACTQuantizer
+from quantizers.pact import PACTQuantizer, PACTQuantizerWrapper
 from quantizers.adaround import AdaRoundQuantizer, AdaRoundQuantizerWrapper
 from quantizers.apot import APoTQuantizer, APoTQuantizerWrapper
 from quantizers.qil import QILQuantizer, QILQuantizerWrapper
@@ -66,7 +66,7 @@ from quantizers.qil import QILQuantizer, QILQuantizerWrapper
 quantizer_name_to_quantizer_class = {
     "no_quant": NoQuantizer,
     "lsq": LSQQuantizer,
-    # "pact": PACTQuantizer,
+    "pact": PACTQuantizer,
     "adaround": AdaRoundQuantizer,
     "apot": APoTQuantizer,
     "qil": QILQuantizer,
@@ -1050,6 +1050,8 @@ def main():
                 quantizer_wrapper = NoQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_wrapper = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
+            elif isinstance(quantizer_obj, PACTQuantizer):
+                quantizer_wrapper = PACTQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
                 bw = quantizer_obj.bit_width if quantizer_obj.bit_width is not None else 4
                 quantizer_wrapper = AdaRoundQuantizerWrapper(
@@ -1527,6 +1529,8 @@ def main():
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_obj = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
+            elif isinstance(quantizer_obj, PACTQuantizer):
+                quantizer_obj = PACTQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
                 bit_width_q = quantizer_obj.bit_width
                 bw = int(bit_width_q) if bit_width_q is not None else 4
@@ -1684,6 +1688,8 @@ def main():
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
                 quantizer_obj = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
+            elif isinstance(quantizer_obj, PACTQuantizer):
+                quantizer_obj = PACTQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
                 bit_width_q = quantizer_obj.bit_width
                 bw = int(bit_width_q) if bit_width_q is not None else 4
