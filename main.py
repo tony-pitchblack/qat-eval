@@ -7,6 +7,7 @@ from typing import Any, Dict, Tuple, List, Optional
 import hashlib
 import json
 import os
+import copy
 
 import pandas as pd
 import torch
@@ -186,7 +187,7 @@ def _finalize_model_size(
 def _save_model_artifact(
     model: torch.nn.Module,
     mlflow_client=None,
-    filename: str = "model.pt",
+    filename: str = "model_after_ptq.pt",
 ) -> None:
     try:
         torch.save(model.state_dict(), filename)
@@ -505,6 +506,7 @@ def fit_simple_cnn(
 
     best_train_metric = float("-inf")
     best_val_metric = float("-inf")
+    best_state = None
 
     for epoch in range(epochs):
         model.train()
@@ -550,6 +552,8 @@ def fit_simple_cnn(
         train_metric_avg = (train_metric_sum / max(1, len(train_loader))) if len(train_loader) > 0 else 0.0
         best_train_metric = max(best_train_metric, train_metric_avg)
         best_val_metric = max(best_val_metric, val_metric_avg)
+        if val_metric_avg > best_val_metric:
+            best_state = copy.deepcopy(model.state_dict())
         if use_mlflow:
             mlflow_client.log_metric("train_loss", train_loss_avg, step=epoch + 1)
             mlflow_client.log_metric(f"train_{metric_name}", train_metric_avg, step=epoch + 1)
@@ -562,6 +566,9 @@ def fit_simple_cnn(
         loss_row = f"{'Loss':12}{train_loss_avg:12.4f}{val_loss_avg:12.4f}"
         metric_row = f"{metric_name:12}{train_metric_avg:12.4f}{val_metric_avg:12.4f}"
         print(f"\nEpoch {epoch+1}/{epochs}\n{header}\n{loss_row}\n{metric_row}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
 
 def fit_lstm(
@@ -595,6 +602,7 @@ def fit_lstm(
 
     best_train_metric = float("-inf")
     best_val_metric = float("-inf")
+    best_state = None
 
     for epoch in range(epochs):
         model.train()
@@ -653,6 +661,8 @@ def fit_lstm(
             train_metric_avg = metric_fn(train_all_logits_cat, train_all_targets_cat)
         best_train_metric = max(best_train_metric, train_metric_avg)
         best_val_metric = max(best_val_metric, val_metric_avg)
+        if val_metric_avg > best_val_metric:
+            best_state = copy.deepcopy(model.state_dict())
         if use_mlflow:
             mlflow_client.log_metric("train_loss", train_loss_avg, step=epoch + 1)
             mlflow_client.log_metric(f"train_{metric_name}", train_metric_avg, step=epoch + 1)
@@ -665,6 +675,9 @@ def fit_lstm(
         loss_row = f"{'Loss':12}{train_loss_avg:12.4f}{val_loss_avg:12.4f}"
         metric_row = f"{metric_name:12}{train_metric_avg:12.4f}{val_metric_avg:12.4f}"
         print(f"\nEpoch {epoch+1}/{epochs}\n{header}\n{loss_row}\n{metric_row}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
 
 def main():
@@ -900,12 +913,11 @@ def main():
                     sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
                     best_train_metrics: Dict[str, float] = {}
                     best_val_metrics: Dict[str, float] = {}
+                    best_sasrec_val_ndcg10 = float("-inf")
+                    best_sasrec_state = None
 
                     total_epochs = int(train_cfg.get("epochs", 1))
-                    if args.from_pretrained:
-                        state = torch.load(args.from_pretrained, map_location=device)
-                        model_obj.load_state_dict(state)
-                    else:
+                    if not args.from_pretrained:
                         for ep in range(total_epochs):
                             avg_loss = _train_one_epoch_sasrec_masked(
                                 model=model_obj,
@@ -979,28 +991,142 @@ def main():
 
                             mlflow_client.log_metrics(log_payload, step=ep + 1)
 
-                    if quantizer_wrapper is not None:
-                        model_obj = quantizer_wrapper.optimize_ptq(
+                            if sequences_val:
+                                current_val_ndcg10 = float(
+                                    val_rank_metrics.get("NDCG_at_10", float("-inf"))
+                                )
+                                if current_val_ndcg10 > best_sasrec_val_ndcg10:
+                                    best_sasrec_val_ndcg10 = current_val_ndcg10
+                                    best_sasrec_state = copy.deepcopy(model_obj.state_dict())
+                    else:
+                        state = torch.load(args.from_pretrained, map_location=device)
+                        model_obj.load_state_dict(state)
+
+                        train_rank_metrics = _evaluate_sampled_sasrec(
                             model=model_obj,
-                            dataloader=train_loader,
+                            sequences=sequences_train,
+                            max_seq_len=max_seq_len,
+                            min_seq_len=min_len,
+                            pad_token_id=pad_token_id,
+                            mask_token_id=mask_token_id,
+                            max_item_id=max_item_id,
                             device=device,
-                            batch_to_model_inputs=_sasrec_batch_to_model_inputs,
-                            mlflow_client=mlflow_client,
+                            ks=(5, 10, 20),
+                            sampled_neg_k=1000,
+                            batch_size=512,
+                            max_batches=None,
                         )
+                        val_rank_metrics: Dict[str, float] = {}
+                        if sequences_val:
+                            val_rank_metrics = _evaluate_sampled_sasrec(
+                                model=model_obj,
+                                sequences=sequences_val,
+                                max_seq_len=max_seq_len,
+                                min_seq_len=min_len,
+                                pad_token_id=pad_token_id,
+                                mask_token_id=mask_token_id,
+                                max_item_id=max_item_id,
+                                device=device,
+                                ks=(5, 10, 20),
+                                sampled_neg_k=1000,
+                                batch_size=512,
+                                max_batches=None,
+                            )
+
+                        pre_log: Dict[str, float] = {}
+                        train_loss_pre = float(train_rank_metrics.get("loss", float("nan")))
+                        pre_log["train_loss"] = train_loss_pre
+                        if sequences_val:
+                            val_loss_pre = float(val_rank_metrics.get("loss", float("nan")))
+                            pre_log["val_loss"] = val_loss_pre
+
+                        for metric_name, _ in sasrec_metrics_cfg:
+                            train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                            val_val = float(
+                                val_rank_metrics.get(metric_name, float("nan"))
+                            ) if sequences_val else float("nan")
+                            prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                            prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                            best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                            best_val_metrics[metric_name] = max(prev_val_best, val_val)
+                            pre_log[f"train_{metric_name}"] = train_val
+                            pre_log[f"val_{metric_name}"] = val_val
+                            pre_log[f"train_max_{metric_name}"] = best_train_metrics[metric_name]
+                            pre_log[f"val_max_{metric_name}"] = best_val_metrics[metric_name]
+
+                        if sequences_val:
+                            current_val_ndcg10 = float(
+                                val_rank_metrics.get("NDCG_at_10", float("-inf"))
+                            )
+                            if current_val_ndcg10 > best_sasrec_val_ndcg10:
+                                best_sasrec_val_ndcg10 = current_val_ndcg10
+                                best_sasrec_state = copy.deepcopy(model_obj.state_dict())
+
+                        mlflow_client.log_metrics(pre_log, step=0)
+
+                    if not args.from_pretrained:
+                        _save_model_artifact(
+                            model_obj,
+                            mlflow_client=mlflow_client,
+                            filename="model_after_qat.pt",
+                        )
+
+                    if best_sasrec_state is not None:
+                        model_obj.load_state_dict(best_sasrec_state)
+
+                    if quantizer_wrapper is not None:
+                        model_obj = quantizer_wrapper.prepare_ptq_model(model_obj).to(device)
+                        metrics_eval_fn = None
+                        if isinstance(quantizer_wrapper, AdaRoundQuantizerWrapper):
+                            eval_sequences = sequences_val if sequences_val else sequences_train
+                            if eval_sequences:
+                                def _adaround_eval_metrics(current_model: SASRecModel, seqs=eval_sequences):
+                                    eval_metrics = _evaluate_sampled_sasrec(
+                                        model=current_model,
+                                        sequences=seqs,
+                                        max_seq_len=max_seq_len,
+                                        min_seq_len=min_len,
+                                        pad_token_id=pad_token_id,
+                                        mask_token_id=mask_token_id,
+                                        max_item_id=max_item_id,
+                                        device=device,
+                                        ks=(5, 10, 20),
+                                        sampled_neg_k=1000,
+                                        batch_size=512,
+                                        max_batches=None,
+                                    )
+                                    out: Dict[str, float] = {}
+                                    for metric_name, _ in sasrec_metrics_cfg:
+                                        if metric_name in eval_metrics:
+                                            out[metric_name] = float(eval_metrics[metric_name])
+                                    if "loss" in eval_metrics:
+                                        out["loss"] = float(eval_metrics["loss"])
+                                    return out
+
+                                metrics_eval_fn = _adaround_eval_metrics
+
+                        optimize_kwargs = {
+                            "model": model_obj,
+                            "dataloader": train_loader,
+                            "device": device,
+                            "batch_to_model_inputs": _sasrec_batch_to_model_inputs,
+                            "mlflow_client": mlflow_client,
+                        }
+                        if metrics_eval_fn is not None:
+                            optimize_kwargs["metrics_eval_fn"] = metrics_eval_fn
+                        model_obj = quantizer_wrapper.optimize_ptq(**optimize_kwargs)
                         model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=mlflow_client)
+                        _save_model_artifact(model_obj, mlflow_client=mlflow_client)
                     else:
                         model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
-                    _save_model_artifact(model_obj, mlflow_client=mlflow_client)
+                        _save_model_artifact(model_obj, mlflow_client=mlflow_client)
             else:
                 sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
                 best_train_metrics: Dict[str, float] = {}
                 best_val_metrics: Dict[str, float] = {}
 
                 total_epochs = int(train_cfg.get("epochs", 1))
-                if args.from_pretrained:
-                    state = torch.load(args.from_pretrained, map_location=device)
-                    model_obj.load_state_dict(state)
-                else:
+                if not args.from_pretrained:
                     for ep in range(total_epochs):
                         avg_loss = _train_one_epoch_sasrec_masked(
                             model=model_obj,
@@ -1062,8 +1188,19 @@ def main():
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
                         else:
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
+                else:
+                    state = torch.load(args.from_pretrained, map_location=device)
+                    model_obj.load_state_dict(state)
+
+                if not args.from_pretrained:
+                    _save_model_artifact(
+                        model_obj,
+                        mlflow_client=None,
+                        filename="model_after_qat.pt",
+                    )
 
                 if quantizer_wrapper is not None:
+                    model_obj = quantizer_wrapper.prepare_ptq_model(model_obj).to(device)
                     model_obj = quantizer_wrapper.optimize_ptq(
                         model=model_obj,
                         dataloader=train_loader,
@@ -1071,9 +1208,10 @@ def main():
                         batch_to_model_inputs=_sasrec_batch_to_model_inputs,
                     )
                     model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=None)
+                    _save_model_artifact(model_obj, mlflow_client=None)
                 else:
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
-                _save_model_artifact(model_obj, mlflow_client=None)
+                    _save_model_artifact(model_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
         metrics_cfg = model_name_to_metrics.get(args.model)
         if not metrics_cfg:
