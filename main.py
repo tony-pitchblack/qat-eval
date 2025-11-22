@@ -338,6 +338,136 @@ def _evaluate_sampled_sasrec(
     return out
 
 
+def _evaluate_full_sasrec(
+    model: SASRecModel,
+    sequences: List[List[int]],
+    max_seq_len: int,
+    min_seq_len: int,
+    pad_token_id: int,
+    mask_token_id: int,
+    max_item_id: int,
+    device: torch.device,
+    ks=(5, 10, 20),
+    batch_size: int = 512,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    model.eval()
+    ds = MaskedSeqDataset(
+        sequences=sequences,
+        max_seq_len=max_seq_len,
+        min_seq_len=min_seq_len,
+        pad_token_id=pad_token_id,
+        mask_token_id=mask_token_id,
+    )
+    if len(ds) == 0:
+        return {f"HR_at_{k}": float("nan") for k in ks} | {
+            f"NDCG_at_{k}": float("nan") for k in ks
+        } | {f"MRR_at_{max(ks)}": float("nan")}
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=MaskedSeqDataset.collate_fn)
+    max_k = max(ks)
+    metrics: Dict[str, float] = {f"HR_at_{k}": 0.0 for k in ks}
+    metrics.update({f"NDCG_at_{k}": 0.0 for k in ks})
+    mrr_total = 0.0
+    n = 0
+    loss_sum = 0.0
+    all_items = torch.arange(1, max_item_id + 1, device=device)
+    with torch.no_grad():
+        batch_idx = 0
+        for batch in tqdm(loader, desc="eval_full", leave=False):
+            inp = batch["masked_input"].to(device)
+            attn = batch["attention_mask"].to(device)
+            pos = batch["positional_ids"].to(device)
+            targets = batch["target_id"].to(device)
+            mask_index = batch["mask_index"].to(device)
+            h = _encode_masked_sequences(model, inp, attn, pos)
+            b, l, e = h.shape
+            preds = h[torch.arange(b, device=device), mask_index]
+            cand_emb = model.item_embedding(all_items)
+            scores = preds @ cand_emb.t()
+            probas = torch.softmax(scores, dim=-1)
+            target_pos = (targets - 1).clamp(min=0, max=max_item_id - 1)
+            loss_batch = -torch.log(probas[torch.arange(b, device=device), target_pos] + 1e-12).mean().item()
+            loss_sum += loss_batch * b
+            topk_idx = scores.topk(max_k, dim=1).indices
+            hit_matrix = topk_idx == target_pos.unsqueeze(1)
+            hit_any = hit_matrix.any(dim=1)
+            hit_pos = torch.argmax(hit_matrix.int(), dim=1)
+            mrr_total += (hit_any * (1.0 / (hit_pos + 1).float())).sum().item()
+            for k in ks:
+                hk = hit_matrix[:, :k].any(dim=1).float()
+                metrics[f"HR_at_{k}"] += hk.sum().item()
+                idx_or_neg1 = torch.where(
+                    hit_matrix[:, :k],
+                    torch.arange(k, device=device).unsqueeze(0).expand(b, k),
+                    torch.full((b, k), -1, device=device),
+                )
+                pos_true = idx_or_neg1.max(dim=1).values
+                mask_valid = pos_true >= 0
+                ndcg = torch.zeros(b, device=device)
+                ndcg[mask_valid] = 1.0 / torch.log2(pos_true[mask_valid].float() + 2.0)
+                metrics[f"NDCG_at_{k}"] += ndcg.sum().item()
+            n += b
+            batch_idx += 1
+            if max_batches is not None and batch_idx >= int(max_batches):
+                break
+    if n == 0:
+        return {
+            **{f"HR_at_{k}": float("nan") for k in ks},
+            **{f"NDCG_at_{k}": float("nan") for k in ks},
+            f"MRR_at_{max(ks)}": float("nan"),
+            "loss": float("nan"),
+        }
+    out: Dict[str, float] = {k: (metrics[k] / n) for k in metrics}
+    out[f"MRR_at_{max(ks)}"] = mrr_total / n
+    out["loss"] = loss_sum / n
+    return out
+
+
+def _evaluate_sasrec_metrics(
+    model: SASRecModel,
+    sequences: List[List[int]],
+    max_seq_len: int,
+    min_seq_len: int,
+    pad_token_id: int,
+    mask_token_id: int,
+    max_item_id: int,
+    device: torch.device,
+    ks=(5, 10, 20),
+    batch_size: int = 512,
+    max_batches: Optional[int] = None,
+    metrics_calc: str = "full",
+    sampled_neg_k: int = 1000,
+) -> Dict[str, float]:
+    if metrics_calc == "sampled":
+        return _evaluate_sampled_sasrec(
+            model=model,
+            sequences=sequences,
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            pad_token_id=pad_token_id,
+            mask_token_id=mask_token_id,
+            max_item_id=max_item_id,
+            device=device,
+            ks=ks,
+            sampled_neg_k=sampled_neg_k,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+    return _evaluate_full_sasrec(
+        model=model,
+        sequences=sequences,
+        max_seq_len=max_seq_len,
+        min_seq_len=min_seq_len,
+        pad_token_id=pad_token_id,
+        mask_token_id=mask_token_id,
+        max_item_id=max_item_id,
+        device=device,
+        ks=ks,
+        batch_size=batch_size,
+        max_batches=max_batches,
+    )
+
+
 def _train_one_epoch_sasrec_masked(
     model: SASRecModel,
     loader: DataLoader,
@@ -708,6 +838,12 @@ def main():
         default=None,
         help="Path to model weights (.pt) to load instead of training before PTQ",
     )
+    parser.add_argument(
+        "--metrics-calc",
+        dest="metrics_calc",
+        choices=["full", "sampled"],
+        default="full",
+    )
     args = parser.parse_args()
 
     if args.model_config:
@@ -919,6 +1055,7 @@ def main():
                     best_val_metrics: Dict[str, float] = {}
                     best_sasrec_val_ndcg10 = float("-inf")
                     best_sasrec_state = None
+                    eval_mode = "sampled" if args.metrics_calc == "sampled" else "full"
 
                     total_epochs = int(train_cfg.get("epochs", 1))
                     if not args.from_pretrained:
@@ -933,8 +1070,8 @@ def main():
                             )
                             log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
 
-                            print(f"[epoch {ep+1}] running sampled train ranking eval...")
-                            train_rank_metrics = _evaluate_sampled_sasrec(
+                            print(f"[epoch {ep+1}] running {eval_mode} train ranking eval...")
+                            train_rank_metrics = _evaluate_sasrec_metrics(
                                 model=model_obj,
                                 sequences=sequences_train,
                                 max_seq_len=max_seq_len,
@@ -944,14 +1081,15 @@ def main():
                                 max_item_id=max_item_id,
                                 device=device,
                                 ks=(5, 10, 20),
-                                sampled_neg_k=1000,
                                 batch_size=512,
                                 max_batches=None,
+                                metrics_calc=args.metrics_calc,
+                                sampled_neg_k=1000,
                             )
                             val_rank_metrics: Dict[str, float] = {}
                             if sequences_val:
-                                print(f"[epoch {ep+1}] running sampled val ranking eval...")
-                                val_rank_metrics = _evaluate_sampled_sasrec(
+                                print(f"[epoch {ep+1}] running {eval_mode} val ranking eval...")
+                                val_rank_metrics = _evaluate_sasrec_metrics(
                                     model=model_obj,
                                     sequences=sequences_val,
                                     max_seq_len=max_seq_len,
@@ -961,9 +1099,10 @@ def main():
                                     max_item_id=max_item_id,
                                     device=device,
                                     ks=(5, 10, 20),
-                                    sampled_neg_k=1000,
                                     batch_size=512,
                                     max_batches=None,
+                                    metrics_calc=args.metrics_calc,
+                                    sampled_neg_k=1000,
                                 )
 
                             val_loss = (
@@ -1006,7 +1145,7 @@ def main():
                         state = torch.load(args.from_pretrained, map_location=device)
                         model_obj.load_state_dict(state)
 
-                        train_rank_metrics = _evaluate_sampled_sasrec(
+                        train_rank_metrics = _evaluate_sasrec_metrics(
                             model=model_obj,
                             sequences=sequences_train,
                             max_seq_len=max_seq_len,
@@ -1016,13 +1155,14 @@ def main():
                             max_item_id=max_item_id,
                             device=device,
                             ks=(5, 10, 20),
-                            sampled_neg_k=1000,
                             batch_size=512,
                             max_batches=None,
+                            metrics_calc=args.metrics_calc,
+                            sampled_neg_k=1000,
                         )
                         val_rank_metrics: Dict[str, float] = {}
                         if sequences_val:
-                            val_rank_metrics = _evaluate_sampled_sasrec(
+                            val_rank_metrics = _evaluate_sasrec_metrics(
                                 model=model_obj,
                                 sequences=sequences_val,
                                 max_seq_len=max_seq_len,
@@ -1032,9 +1172,10 @@ def main():
                                 max_item_id=max_item_id,
                                 device=device,
                                 ks=(5, 10, 20),
-                                sampled_neg_k=1000,
                                 batch_size=512,
                                 max_batches=None,
+                                metrics_calc=args.metrics_calc,
+                                sampled_neg_k=1000,
                             )
 
                         pre_log: Dict[str, float] = {}
@@ -1078,6 +1219,36 @@ def main():
                     if best_sasrec_state is not None:
                         model_obj.load_state_dict(best_sasrec_state)
 
+                    # Log baseline ranking metrics for the non-quantized best checkpoint
+                    if isinstance(quantizer_wrapper, AdaRoundQuantizerWrapper):
+                        eval_sequences = sequences_val if sequences_val else sequences_train
+                        if eval_sequences:
+                            baseline_metrics = _evaluate_sasrec_metrics(
+                                model=model_obj,
+                                sequences=eval_sequences,
+                                max_seq_len=max_seq_len,
+                                min_seq_len=min_len,
+                                pad_token_id=pad_token_id,
+                                mask_token_id=mask_token_id,
+                                max_item_id=max_item_id,
+                                device=device,
+                                ks=(5, 10, 20),
+                                batch_size=512,
+                                max_batches=None,
+                                metrics_calc=args.metrics_calc,
+                                sampled_neg_k=1000,
+                            )
+                            baseline_log: Dict[str, float] = {}
+                            for metric_name, _ in sasrec_metrics_cfg:
+                                if metric_name in baseline_metrics:
+                                    baseline_log[f"adaround_baseline_{metric_name}"] = float(
+                                        baseline_metrics[metric_name]
+                                    )
+                            if "loss" in baseline_metrics:
+                                baseline_log["adaround_baseline_loss"] = float(baseline_metrics["loss"])
+                            if baseline_log:
+                                mlflow_client.log_metrics(baseline_log, step=0)
+
                     if quantizer_wrapper is not None:
                         model_obj = quantizer_wrapper.prepare_ptq_model(model_obj).to(device)
                         metrics_eval_fn = None
@@ -1085,7 +1256,7 @@ def main():
                             eval_sequences = sequences_val if sequences_val else sequences_train
                             if eval_sequences:
                                 def _adaround_eval_metrics(current_model: SASRecModel, seqs=eval_sequences):
-                                    eval_metrics = _evaluate_sampled_sasrec(
+                                    eval_metrics = _evaluate_sasrec_metrics(
                                         model=current_model,
                                         sequences=seqs,
                                         max_seq_len=max_seq_len,
@@ -1095,9 +1266,10 @@ def main():
                                         max_item_id=max_item_id,
                                         device=device,
                                         ks=(5, 10, 20),
-                                        sampled_neg_k=1000,
                                         batch_size=512,
                                         max_batches=None,
+                                        metrics_calc=args.metrics_calc,
+                                        sampled_neg_k=1000,
                                     )
                                     out: Dict[str, float] = {}
                                     for metric_name, _ in sasrec_metrics_cfg:
@@ -1131,6 +1303,7 @@ def main():
                 sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
                 best_train_metrics: Dict[str, float] = {}
                 best_val_metrics: Dict[str, float] = {}
+                eval_mode = "sampled" if args.metrics_calc == "sampled" else "full"
 
                 total_epochs = int(train_cfg.get("epochs", 1))
                 if not args.from_pretrained:
@@ -1143,8 +1316,8 @@ def main():
                             device=device,
                             grad_clip=float(grad_clip) if grad_clip is not None else None,
                         )
-                        print(f"[epoch {ep+1}] running sampled train ranking eval...")
-                        train_rank_metrics = _evaluate_sampled_sasrec(
+                        print(f"[epoch {ep+1}] running {eval_mode} train ranking eval...")
+                        train_rank_metrics = _evaluate_sasrec_metrics(
                             model=model_obj,
                             sequences=sequences_train,
                             max_seq_len=max_seq_len,
@@ -1154,14 +1327,15 @@ def main():
                             max_item_id=max_item_id,
                             device=device,
                             ks=(5, 10, 20),
-                            sampled_neg_k=1000,
                             batch_size=512,
                             max_batches=None,
+                            metrics_calc=args.metrics_calc,
+                            sampled_neg_k=1000,
                         )
                         val_rank_metrics: Dict[str, float] = {}
                         if sequences_val:
-                            print(f"[epoch {ep+1}] running sampled val ranking eval...")
-                            val_rank_metrics = _evaluate_sampled_sasrec(
+                            print(f"[epoch {ep+1}] running {eval_mode} val ranking eval...")
+                            val_rank_metrics = _evaluate_sasrec_metrics(
                                 model=model_obj,
                                 sequences=sequences_val,
                                 max_seq_len=max_seq_len,
@@ -1171,9 +1345,10 @@ def main():
                                 max_item_id=max_item_id,
                                 device=device,
                                 ks=(5, 10, 20),
-                                sampled_neg_k=1000,
                                 batch_size=512,
                                 max_batches=None,
+                                metrics_calc=args.metrics_calc,
+                                sampled_neg_k=1000,
                             )
 
                         val_loss = (
