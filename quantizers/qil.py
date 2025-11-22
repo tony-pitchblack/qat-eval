@@ -471,14 +471,15 @@ class QILQuantizerWrapper(BaseQuantizerWrapper):
         self, 
         quantizer: QILQuantizer, 
         gamma_weight: Optional[float] = None,
-        skip_first_last: bool = True
+        skip_first_last: bool = True,
+        logging_backend: str = "none",
     ):
-        super().__init__(quantizer)
+        super().__init__(quantizer, logging_backend=logging_backend)
         self.gamma_weight = gamma_weight
         self.skip_first_last = skip_first_last
         self._layer_count = 0
     
-    def prepare_model(self, model: nn.Module, is_first_call: bool = True) -> nn.Module:
+    def prepare_qat_model(self, model: nn.Module, is_first_call: bool = True) -> nn.Module:
         if is_first_call:
             self._layer_count = self._count_quantizable_layers(model)
         
@@ -563,3 +564,6 @@ class QILQuantizerWrapper(BaseQuantizerWrapper):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
+
+    def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
+        return model
