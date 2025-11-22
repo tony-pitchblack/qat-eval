@@ -54,7 +54,8 @@ class RCFFunction(torch.autograd.Function):
         grad_alpha_inside = (x_proj_normalized - x_normalized) * (~outlier_mask).float()
         
         grad_alpha = (grad_alpha_outlier + grad_alpha_inside) * grad_output
-        grad_alpha = grad_alpha.sum().view(alpha.shape)
+        grad_alpha = grad_alpha.sum()
+        grad_alpha = grad_alpha.view_as(alpha)
         
         return grad_x, grad_alpha, None, None, None
 
@@ -480,11 +481,11 @@ class APoTMultiheadAttention(nn.Module):
 class APoTQuantizerWrapper(BaseQuantizerWrapper):
     """Wrapper to apply APoT quantization to entire model"""
     
-    def __init__(self, quantizer: APoTQuantizer, k: int = 2):
-        super().__init__(quantizer)
+    def __init__(self, quantizer: APoTQuantizer, k: int = 2, logging_backend: str = "none"):
+        super().__init__(quantizer, logging_backend=logging_backend)
         self.k = k
     
-    def prepare_model(self, model: nn.Module) -> nn.Module:
+    def prepare_qat_model(self, model: nn.Module) -> nn.Module:
         for name, module in list(model.named_children()):
             if isinstance(module, nn.MultiheadAttention):
                 setattr(
@@ -537,9 +538,12 @@ class APoTQuantizerWrapper(BaseQuantizerWrapper):
                     )
                 )
             else:
-                self.prepare_model(module)
+                self.prepare_qat_model(module)
         
         return model
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
+
+    def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
+        return model

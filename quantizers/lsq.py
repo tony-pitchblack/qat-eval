@@ -306,10 +306,10 @@ class LSQMultiheadAttention(nn.Module):
 
 
 class LSQQuantizerWrapper(BaseQuantizerWrapper):
-    def __init__(self, quantizer: LSQQuantizer):
-        super().__init__(quantizer)
+    def __init__(self, quantizer: LSQQuantizer, logging_backend: str = "none"):
+        super().__init__(quantizer, logging_backend=logging_backend)
 
-    def prepare_model(self, model: nn.Module) -> nn.Module:
+    def prepare_qat_model(self, model: nn.Module) -> nn.Module:
         for name, module in list(model.named_children()):
             if isinstance(module, nn.MultiheadAttention):
                 setattr(model, name, LSQMultiheadAttention(module, bit_width=self._quantizer.bit_width))
@@ -322,8 +322,11 @@ class LSQQuantizerWrapper(BaseQuantizerWrapper):
             elif isinstance(module, nn.LayerNorm):
                 setattr(model, name, LSQLayerNorm(module, bit_width=self._quantizer.bit_width))
             else:
-                self.prepare_model(module)
+                self.prepare_qat_model(module)
         return model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
+
+    def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
+        return model
