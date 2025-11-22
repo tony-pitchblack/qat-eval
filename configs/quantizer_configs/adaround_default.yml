@@ -1,5 +1,5 @@
 quantizer:
-  bit_width: 4
+  bit_width: 8
   per_channel: True
 
 quantizer_optimizer:
