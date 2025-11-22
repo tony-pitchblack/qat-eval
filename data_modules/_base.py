@@ -10,6 +10,7 @@ class BaseDataset(Dataset, ABC):
     def inferred_params(self) -> Any:
         if not hasattr(self, "_inferred_params"):
             from types import SimpleNamespace
+
             self._inferred_params = SimpleNamespace()
         return self._inferred_params
 

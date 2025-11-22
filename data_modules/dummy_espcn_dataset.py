@@ -1,8 +1,6 @@
-# TODO: rename file & class
-
 from typing import Any, List
 
-from datasets._base import BaseDataset
+from data_modules._base import BaseDataset
 
 
 class DummyESPCNDataset(BaseDataset):
@@ -18,3 +16,5 @@ class DummyESPCNDataset(BaseDataset):
     @staticmethod
     def collate_fn(batch: List[Any]) -> Any:
         raise NotImplementedError("DummyESPCNDataset collate_fn not implemented")
+
+
