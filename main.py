@@ -899,6 +899,12 @@ def main():
         default="none",
     )
     parser.add_argument(
+        "--experiment-postfix",
+        dest="experiment_postfix",
+        default=None,
+        help="Optional postfix to append to the experiment name for logging backends such as MLflow",
+    )
+    parser.add_argument(
         "--from-pretrained",
         dest="from_pretrained",
         default=None,
@@ -969,7 +975,10 @@ def main():
         import mlflow  # type: ignore[import]
 
         mlflow.set_tracking_uri(mlflow_tracking_uri)
-        mlflow.set_experiment(f"QAT-eval-{args.model}")
+        exp_name = f"QAT-eval-{args.model}"
+        if args.experiment_postfix:
+            exp_name = f"{exp_name}-{args.experiment_postfix}"
+        mlflow.set_experiment(exp_name)
         mlflow_client = mlflow
 
     if args.model == "sasrec":
