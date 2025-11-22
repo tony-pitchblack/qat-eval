@@ -54,7 +54,7 @@ model_name_to_model_dataset_class = {
 }
 
 # Import quantizers
-from quantizers.no_quant import NoQuantizer
+from quantizers.no_quant import NoQuantizer, NoQuantizerWrapper
 from quantizers.lsq import LSQQuantizer, LSQQuantizerWrapper
 from quantizers.pact import PACTQuantizer
 from quantizers.adaround import AdaRoundQuantizer, AdaRoundQuantizerWrapper
@@ -181,6 +181,19 @@ def _finalize_model_size(
             f"(delta: {delta_pct:.2f}%)"
         )
     return model
+
+
+def _save_model_artifact(
+    model: torch.nn.Module,
+    mlflow_client=None,
+    filename: str = "model.pt",
+) -> None:
+    try:
+        torch.save(model.state_dict(), filename)
+        if mlflow_client is not None:
+            mlflow_client.log_artifact(filename)
+    except Exception:
+        pass
 
 
 def _log_mlflow_dataset(mlflow_client, train_path: str, dataset_name: str) -> None:
@@ -331,17 +344,11 @@ def _train_one_epoch_sasrec_masked(
     neg_k: int,
     device: torch.device,
     grad_clip: Optional[float],
-    quantizer_module: Optional[torch.nn.Module] = None,
 ) -> float:
     model.train()
     opt = torch.optim.AdamW(model.parameters())
     running = 0.0
     steps = 0
-
-    def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
-        if quantizer_module is None:
-            return x
-        return quantizer_module(x)
 
     pbar = tqdm(loader, desc="train", leave=False)
     for batch in pbar:
@@ -360,7 +367,6 @@ def _train_one_epoch_sasrec_masked(
         anchor = preds.unsqueeze(1)
         all_counterparty = torch.cat([pos_emb, neg_emb], dim=1)
         logits = (anchor * all_counterparty).sum(dim=-1)
-        logits = apply_quantizer(logits)
         probas = torch.softmax(logits, dim=-1)
         loss = -torch.log(probas[:, 0] + 1e-12).mean()
         opt.zero_grad(set_to_none=True)
@@ -397,8 +403,8 @@ def fit_sasrec(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
-        model = quantizer_module.prepare_model(model).to(device)
+    if isinstance(quantizer_module, BaseQuantizerWrapper):
+        model = quantizer_module.prepare_qat_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
         return quantizer_module(x)
@@ -488,8 +494,8 @@ def fit_simple_cnn(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
-        model = quantizer_module.prepare_model(model).to(device)
+    if isinstance(quantizer_module, BaseQuantizerWrapper):
+        model = quantizer_module.prepare_qat_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
         return quantizer_module(x)
@@ -578,8 +584,8 @@ def fit_lstm(
 
     model = model.to(device)
     quantizer_module = quantizer_module.to(device)
-    if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
-        model = quantizer_module.prepare_model(model).to(device)
+    if isinstance(quantizer_module, BaseQuantizerWrapper):
+        model = quantizer_module.prepare_qat_model(model).to(device)
 
     def apply_quantizer(x: torch.Tensor) -> torch.Tensor:
         return quantizer_module(x)
@@ -683,6 +689,12 @@ def main():
         choices=["none", "mlflow"],
         default="none",
     )
+    parser.add_argument(
+        "--from-pretrained",
+        dest="from_pretrained",
+        default=None,
+        help="Path to model weights (.pt) to load instead of training before PTQ",
+    )
     args = parser.parse_args()
 
     if args.model_config:
@@ -744,6 +756,11 @@ def main():
         mlflow_client = mlflow
 
     if args.model == "sasrec":
+        def _sasrec_batch_to_model_inputs(batch, dev: torch.device):
+            items = batch["masked_input"].to(dev)
+            lengths = batch["attention_mask"].sum(dim=1).to(dev)
+            return (items, lengths)
+
         for cfg in grid_cfgs:
             model_cfg = cfg.get("model", {})
             dataset_cfg = cfg.get("dataset", {})
@@ -801,30 +818,42 @@ def main():
             if quantizer_cls is None:
                 raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
             quantizer_obj = quantizer_cls(**quantizer_cfg)
-            if isinstance(quantizer_obj, LSQQuantizer):
-                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+            quantizer_wrapper: Optional[BaseQuantizerWrapper] = None
+            if isinstance(quantizer_obj, NoQuantizer):
+                quantizer_wrapper = NoQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
+            elif isinstance(quantizer_obj, LSQQuantizer):
+                quantizer_wrapper = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
-                bit_width_q = quantizer_obj.bit_width
-                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+                bw = quantizer_obj.bit_width if quantizer_obj.bit_width is not None else 4
+                quantizer_wrapper = AdaRoundQuantizerWrapper(
+                    quantizer_obj,
+                    bit_width=int(bw),
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, APoTQuantizer):
-                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
-                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+                quantizer_wrapper = APoTQuantizerWrapper(
+                    quantizer_obj,
+                    k=int(getattr(quantizer_obj, "k", 2)),
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, QILQuantizer):
-                gamma_weight = quantizer_cfg.get('gamma_weight', None)
-                skip_first_last = quantizer_cfg.get('skip_first_last', True)
-                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
+                gamma_weight = quantizer_cfg.get("gamma_weight", None)
+                skip_first_last = quantizer_cfg.get("skip_first_last", True)
+                quantizer_wrapper = QILQuantizerWrapper(
+                    quantizer_obj,
+                    gamma_weight=gamma_weight,
+                    skip_first_last=skip_first_last,
+                    logging_backend=args.logging_backend,
+                )
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
-            if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
-                bit_width = getattr(quantizer_obj._quantizer, "bit_width", None)
             if bit_width is not None:
                 print(f"Using quantization bit width: {bit_width}")
             else:
                 print("No quantization is used")
 
-            quantizer_module: torch.nn.Module = quantizer_obj
-            if isinstance(quantizer_module, (LSQQuantizerWrapper, AdaRoundQuantizerWrapper, APoTQuantizerWrapper, QILQuantizerWrapper)):
-                model_obj = quantizer_module.prepare_model(model_obj).to(device)
+            if quantizer_wrapper is not None:
+                model_obj = quantizer_wrapper.prepare_qat_model(model_obj).to(device)
             else:
                 model_obj = model_obj.to(device)
 
@@ -873,6 +902,105 @@ def main():
                     best_val_metrics: Dict[str, float] = {}
 
                     total_epochs = int(train_cfg.get("epochs", 1))
+                    if args.from_pretrained:
+                        state = torch.load(args.from_pretrained, map_location=device)
+                        model_obj.load_state_dict(state)
+                    else:
+                        for ep in range(total_epochs):
+                            avg_loss = _train_one_epoch_sasrec_masked(
+                                model=model_obj,
+                                loader=train_loader,
+                                max_item_id=max_item_id,
+                                neg_k=neg_k,
+                                device=device,
+                                grad_clip=float(grad_clip) if grad_clip is not None else None,
+                            )
+                            log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
+
+                            print(f"[epoch {ep+1}] running sampled train ranking eval...")
+                            train_rank_metrics = _evaluate_sampled_sasrec(
+                                model=model_obj,
+                                sequences=sequences_train,
+                                max_seq_len=max_seq_len,
+                                min_seq_len=min_len,
+                                pad_token_id=pad_token_id,
+                                mask_token_id=mask_token_id,
+                                max_item_id=max_item_id,
+                                device=device,
+                                ks=(5, 10, 20),
+                                sampled_neg_k=1000,
+                                batch_size=512,
+                                max_batches=None,
+                            )
+                            val_rank_metrics: Dict[str, float] = {}
+                            if sequences_val:
+                                print(f"[epoch {ep+1}] running sampled val ranking eval...")
+                                val_rank_metrics = _evaluate_sampled_sasrec(
+                                    model=model_obj,
+                                    sequences=sequences_val,
+                                    max_seq_len=max_seq_len,
+                                    min_seq_len=min_len,
+                                    pad_token_id=pad_token_id,
+                                    mask_token_id=mask_token_id,
+                                    max_item_id=max_item_id,
+                                    device=device,
+                                    ks=(5, 10, 20),
+                                    sampled_neg_k=1000,
+                                    batch_size=512,
+                                    max_batches=None,
+                                )
+
+                            val_loss = (
+                                float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
+                            )
+                            log_payload["val_loss"] = val_loss
+
+                            for metric_name, _ in sasrec_metrics_cfg:
+                                train_val = float(train_rank_metrics.get(metric_name, float("nan")))
+                                val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
+                                    "nan"
+                                )
+                                prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
+                                prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
+                                best_train_metrics[metric_name] = max(prev_train_best, train_val)
+                                best_val_metrics[metric_name] = max(prev_val_best, val_val)
+                                log_payload[f"train_{metric_name}"] = train_val
+                                log_payload[f"val_{metric_name}"] = val_val
+                                log_payload[f"train_max_{metric_name}"] = best_train_metrics[metric_name]
+                                log_payload[f"val_max_{metric_name}"] = best_val_metrics[metric_name]
+
+                            if sequences_val:
+                                metrics_str = " ".join(
+                                    [f"{k}={v:.4f}" for k, v in val_rank_metrics.items()]
+                                )
+                                print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
+                            else:
+                                print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
+
+                            mlflow_client.log_metrics(log_payload, step=ep + 1)
+
+                    if quantizer_wrapper is not None:
+                        model_obj = quantizer_wrapper.optimize_ptq(
+                            model=model_obj,
+                            dataloader=train_loader,
+                            device=device,
+                            batch_to_model_inputs=_sasrec_batch_to_model_inputs,
+                            mlflow_client=mlflow_client,
+                        )
+                        model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=mlflow_client)
+                    else:
+                        model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+                    _save_model_artifact(model_obj, mlflow_client=mlflow_client)
+            else:
+                sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
+                best_train_metrics: Dict[str, float] = {}
+                best_val_metrics: Dict[str, float] = {}
+
+                total_epochs = int(train_cfg.get("epochs", 1))
+                if args.from_pretrained:
+                    state = torch.load(args.from_pretrained, map_location=device)
+                    model_obj.load_state_dict(state)
+                else:
                     for ep in range(total_epochs):
                         avg_loss = _train_one_epoch_sasrec_masked(
                             model=model_obj,
@@ -881,10 +1009,7 @@ def main():
                             neg_k=neg_k,
                             device=device,
                             grad_clip=float(grad_clip) if grad_clip is not None else None,
-                            quantizer_module=quantizer_module,
                         )
-                        log_payload: Dict[str, float] = {"train_loss": float(avg_loss)}
-
                         print(f"[epoch {ep+1}] running sampled train ranking eval...")
                         train_rank_metrics = _evaluate_sampled_sasrec(
                             model=model_obj,
@@ -921,7 +1046,6 @@ def main():
                         val_loss = (
                             float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
                         )
-                        log_payload["val_loss"] = val_loss
 
                         for metric_name, _ in sasrec_metrics_cfg:
                             train_val = float(train_rank_metrics.get(metric_name, float("nan")))
@@ -932,92 +1056,24 @@ def main():
                             prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
                             best_train_metrics[metric_name] = max(prev_train_best, train_val)
                             best_val_metrics[metric_name] = max(prev_val_best, val_val)
-                            log_payload[f"train_{metric_name}"] = train_val
-                            log_payload[f"val_{metric_name}"] = val_val
-                            log_payload[f"train_max_{metric_name}"] = best_train_metrics[metric_name]
-                            log_payload[f"val_max_{metric_name}"] = best_val_metrics[metric_name]
 
                         if sequences_val:
-                            metrics_str = " ".join(
-                                [f"{k}={v:.4f}" for k, v in val_rank_metrics.items()]
-                            )
+                            metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_rank_metrics.items()])
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
                         else:
                             print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
 
-                        mlflow_client.log_metrics(log_payload, step=ep + 1)
-
-                    model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
-            else:
-                sasrec_metrics_cfg = model_name_to_metrics.get("sasrec", [])
-                best_train_metrics: Dict[str, float] = {}
-                best_val_metrics: Dict[str, float] = {}
-
-                total_epochs = int(train_cfg.get("epochs", 1))
-                for ep in range(total_epochs):
-                    avg_loss = _train_one_epoch_sasrec_masked(
+                if quantizer_wrapper is not None:
+                    model_obj = quantizer_wrapper.optimize_ptq(
                         model=model_obj,
-                        loader=train_loader,
-                        max_item_id=max_item_id,
-                        neg_k=neg_k,
+                        dataloader=train_loader,
                         device=device,
-                        grad_clip=float(grad_clip) if grad_clip is not None else None,
-                        quantizer_module=quantizer_module,
+                        batch_to_model_inputs=_sasrec_batch_to_model_inputs,
                     )
-                    print(f"[epoch {ep+1}] running sampled train ranking eval...")
-                    train_rank_metrics = _evaluate_sampled_sasrec(
-                        model=model_obj,
-                        sequences=sequences_train,
-                        max_seq_len=max_seq_len,
-                        min_seq_len=min_len,
-                        pad_token_id=pad_token_id,
-                        mask_token_id=mask_token_id,
-                        max_item_id=max_item_id,
-                        device=device,
-                        ks=(5, 10, 20),
-                        sampled_neg_k=1000,
-                        batch_size=512,
-                        max_batches=None,
-                    )
-                    val_rank_metrics: Dict[str, float] = {}
-                    if sequences_val:
-                        print(f"[epoch {ep+1}] running sampled val ranking eval...")
-                        val_rank_metrics = _evaluate_sampled_sasrec(
-                            model=model_obj,
-                            sequences=sequences_val,
-                            max_seq_len=max_seq_len,
-                            min_seq_len=min_len,
-                            pad_token_id=pad_token_id,
-                            mask_token_id=mask_token_id,
-                            max_item_id=max_item_id,
-                            device=device,
-                            ks=(5, 10, 20),
-                            sampled_neg_k=1000,
-                            batch_size=512,
-                            max_batches=None,
-                        )
-
-                    val_loss = (
-                        float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
-                    )
-
-                    for metric_name, _ in sasrec_metrics_cfg:
-                        train_val = float(train_rank_metrics.get(metric_name, float("nan")))
-                        val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
-                            "nan"
-                        )
-                        prev_train_best = best_train_metrics.get(metric_name, float("-inf"))
-                        prev_val_best = best_val_metrics.get(metric_name, float("-inf"))
-                        best_train_metrics[metric_name] = max(prev_train_best, train_val)
-                        best_val_metrics[metric_name] = max(prev_val_best, val_val)
-
-                    if sequences_val:
-                        metrics_str = " ".join([f"{k}={v:.4f}" for k, v in val_rank_metrics.items()])
-                        print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  VAL {metrics_str}")
-                    else:
-                        print(f"[epoch {ep+1}] avg_loss={avg_loss:.4f}  (no val set)")
-
-                model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                    model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=None)
+                else:
+                    model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                _save_model_artifact(model_obj, mlflow_client=None)
     elif args.model == "simple_cnn":
         metrics_cfg = model_name_to_metrics.get(args.model)
         if not metrics_cfg:
@@ -1053,17 +1109,31 @@ def main():
                 raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
-                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+                quantizer_obj = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
                 bit_width_q = quantizer_obj.bit_width
-                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+                bw = int(bit_width_q) if bit_width_q is not None else 4
+                quantizer_obj = AdaRoundQuantizerWrapper(
+                    quantizer_obj,
+                    bit_width=bw,
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, APoTQuantizer):
-                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
-                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+                k = getattr(quantizer_obj, "k", quantizer_cfg.get("k", 2))
+                quantizer_obj = APoTQuantizerWrapper(
+                    quantizer_obj,
+                    k=int(k),
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, QILQuantizer):
-                gamma_weight = quantizer_cfg.get('gamma_weight', None)
-                skip_first_last = quantizer_cfg.get('skip_first_last', True)
-                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
+                gamma_weight = quantizer_cfg.get("gamma_weight", None)
+                skip_first_last = quantizer_cfg.get("skip_first_last", True)
+                quantizer_obj = QILQuantizerWrapper(
+                    quantizer_obj,
+                    gamma_weight=gamma_weight,
+                    skip_first_last=skip_first_last,
+                    logging_backend=args.logging_backend,
+                )
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
             if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
@@ -1117,6 +1187,7 @@ def main():
                         mlflow_client=mlflow_client,
                     )
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+                    _save_model_artifact(model_obj, mlflow_client=mlflow_client)
             else:
                 fit_simple_cnn(
                     model_obj,
@@ -1129,6 +1200,7 @@ def main():
                     device,
                 )
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                _save_model_artifact(model_obj, mlflow_client=None)
     elif args.model == "lstm":
         metrics_cfg = model_name_to_metrics.get(args.model)
         if not metrics_cfg:
@@ -1178,17 +1250,31 @@ def main():
                 raise NotImplementedError(f"Quantizer '{args.quantizer}' not implemented")
             quantizer_obj = quantizer_cls(**quantizer_cfg)
             if isinstance(quantizer_obj, LSQQuantizer):
-                quantizer_obj = LSQQuantizerWrapper(quantizer_obj)
+                quantizer_obj = LSQQuantizerWrapper(quantizer_obj, logging_backend=args.logging_backend)
             elif isinstance(quantizer_obj, AdaRoundQuantizer):
                 bit_width_q = quantizer_obj.bit_width
-                quantizer_obj = AdaRoundQuantizerWrapper(quantizer_obj, bit_width=bit_width_q)
+                bw = int(bit_width_q) if bit_width_q is not None else 4
+                quantizer_obj = AdaRoundQuantizerWrapper(
+                    quantizer_obj,
+                    bit_width=bw,
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, APoTQuantizer):
-                k = getattr(quantizer_obj, 'k', quantizer_cfg.get('k', 2))
-                quantizer_obj = APoTQuantizerWrapper(quantizer_obj, k=k)
+                k = getattr(quantizer_obj, "k", quantizer_cfg.get("k", 2))
+                quantizer_obj = APoTQuantizerWrapper(
+                    quantizer_obj,
+                    k=int(k),
+                    logging_backend=args.logging_backend,
+                )
             elif isinstance(quantizer_obj, QILQuantizer):
-                gamma_weight = quantizer_cfg.get('gamma_weight', None)
-                skip_first_last = quantizer_cfg.get('skip_first_last', True)
-                quantizer_obj = QILQuantizerWrapper(quantizer_obj, gamma_weight=gamma_weight, skip_first_last=skip_first_last)
+                gamma_weight = quantizer_cfg.get("gamma_weight", None)
+                skip_first_last = quantizer_cfg.get("skip_first_last", True)
+                quantizer_obj = QILQuantizerWrapper(
+                    quantizer_obj,
+                    gamma_weight=gamma_weight,
+                    skip_first_last=skip_first_last,
+                    logging_backend=args.logging_backend,
+                )
 
             bit_width = getattr(quantizer_obj, "bit_width", None)
             if bit_width is None and isinstance(quantizer_obj, BaseQuantizerWrapper):
@@ -1238,6 +1324,7 @@ def main():
                         mlflow_client=mlflow_client,
                     )
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
+                    _save_model_artifact(model_obj, mlflow_client=mlflow_client)
             else:
                 fit_lstm(
                     model_obj,
@@ -1250,6 +1337,7 @@ def main():
                     device,
                 )
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
+                _save_model_artifact(model_obj, mlflow_client=None)
 
 
 if __name__ == "__main__":
