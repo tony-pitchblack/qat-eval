@@ -94,6 +94,28 @@ python main.py --model espcn       --quantizer lsq  --quantizer-config bit_width
 python main.py --model lstm        --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
 ```
 
+### Gridsearch examples
+
+- **SASRec dropout gridsearch (model config grid over `dropout`)**:
+```bash
+python main.py \
+  --model sasrec \
+  --quantizer lsq \
+  --logging-backend mlflow \
+  --model-config configs/model_configs/sasrec_gridsearch_dropout.yml \
+  --experiment-postfix dropout-gridsearch
+```
+
+- **SASRec weight_decay gridsearch (training config grid over `weight_decay`)**:
+```bash
+python main.py \
+  --model sasrec \
+  --quantizer lsq \
+  --logging-backend mlflow \
+  --model-config configs/model_configs/sasrec_gridsearch_weight_decay.yml \
+  --experiment-postfix weight-decay-gridsearch
+```
+
 ## Advanced Docker container usage with Jupyter & MLflow
 To start Jupyter and MLflow servers in dedicated tmux sessions inside the container, first set up hosts/ports in `.env` file:
 ```bash
