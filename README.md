@@ -81,6 +81,11 @@ python main.py --model espcn       --quantizer lsq --quantizer-config default --
 python main.py --model lstm        --quantizer lsq --quantizer-config default --logging-backend mlflow
 ```
 
+- **AdaRound PTQ from a pretrained SASRec checkpoint** (loads model, then runs AdaRound-based PTQ):
+```bash
+python main.py --model sasrec --quantizer adaround --quantizer-config default --logging-backend mlflow --from-pretrained /path/to/sasrec_checkpoint.pt
+```
+
 - **With bit-width gridsearch quantizer config** (e.g. LSQ over bit_width \([2, 4, 8, 16]\)):
 ```bash
 python main.py --model sasrec      --quantizer lsq  --quantizer-config bit_width_gridsearch --logging-backend mlflow
