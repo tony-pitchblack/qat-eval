@@ -729,12 +729,14 @@ def main():
     base_dataset_cfg = cfg_model_full.get("dataset", {})
     base_train_cfg = cfg_model_full.get("training", {})
     base_quantizer_cfg = cfg_quantizer_full.get("quantizer", {})
+    base_quantizer_opt_cfg = cfg_quantizer_full.get("quantizer_optimizer", {})
 
     combined_base_cfg: Dict[str, Any] = {
         "model": base_model_cfg,
         "dataset": base_dataset_cfg,
         "training": base_train_cfg,
         "quantizer": base_quantizer_cfg,
+        "quantizer_optimizer": base_quantizer_opt_cfg,
     }
     grid_cfgs = _expand_config_grid(combined_base_cfg)
 
@@ -779,6 +781,7 @@ def main():
             dataset_cfg = cfg.get("dataset", {})
             train_cfg = cfg.get("training", {})
             quantizer_cfg = cfg.get("quantizer", {})
+            quantizer_opt_cfg = cfg.get("quantizer_optimizer", {})
 
             root_dir = str(dataset_cfg.get("root_dir", os.path.join("external_repos", "TIFUKNN", "data")))
             dataset_name = str(dataset_cfg.get("dataset", "Dunnhumby"))
@@ -897,6 +900,7 @@ def main():
                         ("dataset", dataset_cfg),
                         ("training", train_cfg),
                         ("quantizer", quantizer_cfg),
+                        ("quantizer_optimizer", quantizer_opt_cfg),
                     ]:
                         for k, v in section_cfg.items():
                             all_params[f"{section_name}.{k}"] = v
@@ -1112,6 +1116,9 @@ def main():
                             "batch_to_model_inputs": _sasrec_batch_to_model_inputs,
                             "mlflow_client": mlflow_client,
                         }
+                        for k in ("num_iterations", "batch_size", "lr", "lambda_reg", "max_samples"):
+                            if k in quantizer_opt_cfg:
+                                optimize_kwargs[k] = quantizer_opt_cfg[k]
                         if metrics_eval_fn is not None:
                             optimize_kwargs["metrics_eval_fn"] = metrics_eval_fn
                         model_obj = quantizer_wrapper.optimize_ptq(**optimize_kwargs)
@@ -1201,12 +1208,16 @@ def main():
 
                 if quantizer_wrapper is not None:
                     model_obj = quantizer_wrapper.prepare_ptq_model(model_obj).to(device)
-                    model_obj = quantizer_wrapper.optimize_ptq(
-                        model=model_obj,
-                        dataloader=train_loader,
-                        device=device,
-                        batch_to_model_inputs=_sasrec_batch_to_model_inputs,
-                    )
+                    optimize_kwargs = {
+                        "model": model_obj,
+                        "dataloader": train_loader,
+                        "device": device,
+                        "batch_to_model_inputs": _sasrec_batch_to_model_inputs,
+                    }
+                    for k in ("num_iterations", "batch_size", "lr", "lambda_reg", "max_samples"):
+                        if k in quantizer_opt_cfg:
+                            optimize_kwargs[k] = quantizer_opt_cfg[k]
+                    model_obj = quantizer_wrapper.optimize_ptq(**optimize_kwargs)
                     model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=None)
                     _save_model_artifact(model_obj, mlflow_client=None)
                 else:
