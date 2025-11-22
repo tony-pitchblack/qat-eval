@@ -16,6 +16,8 @@ import seaborn as sns
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 import pandas as pd
+from data_modules.masked_seq_dataset import load_tifuknn_dfs, build_sequences_from_df
+from main import _evaluate_sasrec_metrics
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -613,10 +615,12 @@ def prepare_model_for_inference(
 def evaluate_model_quality(
     model: nn.Module,
     model_name: str,
+    model_cfg: Dict[str, Any],
     dataset_cfg: Dict[str, Any],
     n_samples: int,
     batch_size: int,
-    device: torch.device
+    device: torch.device,
+    metrics_calc: Optional[str] = None,
 ) -> Dict[str, float]:
     """Evaluate model quality using appropriate metrics"""
     from metrics import model_name_to_metrics
@@ -625,6 +629,58 @@ def evaluate_model_quality(
     if not metrics_cfg:
         print(f"No metrics configured for model: {model_name}")
         return {}
+
+    # Special handling for SASRec with sampled metrics calculation
+    if model_name == "sasrec" and metrics_calc == "sampled":
+        root_dir = dataset_cfg.get('root_dir', os.path.join('external_repos', 'TIFUKNN', 'data'))
+        dataset_name = dataset_cfg.get('dataset', 'Dunnhumby')
+        min_len = dataset_cfg.get('min_len', 1)
+        max_seq_len = model_cfg.get('max_seq_len', 10)
+        pad_token_id = model_cfg.get('pad_token_id', 0)
+
+        try:
+            df_train, df_val = load_tifuknn_dfs(root_dir, dataset_name)
+        except Exception as e:
+            print(f"Warning: Could not load TIFUKNN data for SASRec: {e}")
+            return {}
+
+        max_train = int(df_train["MATERIAL_NUMBER"].max()) if not df_train.empty else 0
+        max_val = int(df_val["MATERIAL_NUMBER"].max()) if not df_val.empty else 0
+        max_item_id = max(max_train, max_val)
+        if max_item_id <= 0:
+            print("Warning: Failed to infer a positive max_item_id from data")
+            return {}
+
+        mask_token_id = max_item_id + 1
+        sequences_val = build_sequences_from_df(
+            df_val,
+            min_seq_len=min_len,
+            max_seq_len=max_seq_len,
+        )
+        if not sequences_val:
+            print("Warning: No validation sequences built for SASRec evaluation")
+            return {}
+
+        # Limit number of batches according to n_samples / batch_size
+        max_batches: Optional[int] = None
+        if n_samples > 0 and batch_size > 0:
+            max_batches = max(1, n_samples // batch_size)
+
+        return _evaluate_sasrec_metrics(
+            model=model,
+            sequences=sequences_val,
+            max_seq_len=max_seq_len,
+            min_seq_len=min_len,
+            pad_token_id=pad_token_id,
+            mask_token_id=mask_token_id,
+            max_item_id=max_item_id,
+            device=device,
+            ks=(5, 10, 20),
+            batch_size=batch_size,
+            max_batches=max_batches,
+            metrics_calc=metrics_calc or "sampled",
+            sampled_neg_k=1000,
+        )
     
     dataset_class = model_name_to_dataset_class.get(model_name)
     if dataset_class is None:
@@ -1642,7 +1698,8 @@ def run_benchmark(
     num_warmup: int = 10,
     num_iterations: int = 100,
     export_onnx: bool = False,
-    onnx_quantization_type: str = 'dynamic'
+    onnx_quantization_type: str = 'dynamic',
+    metrics_calc: Optional[str] = None,
 ):
     """Run benchmark on all models in the specified directory."""
     
@@ -1720,13 +1777,26 @@ def run_benchmark(
             # Evaluate model quality (use more samples for better metrics)
             print("Evaluating model quality...")
             eval_n_samples = max(n_samples, 2000)  # Use at least 2000 samples for quality eval
+
+            # Determine effective metrics_calc per model
+            effective_metrics_calc: Optional[str]
+            if metrics_calc is not None:
+                effective_metrics_calc = metrics_calc
+            else:
+                if metadata['model_name'] == "sasrec":
+                    effective_metrics_calc = "sampled"
+                else:
+                    effective_metrics_calc = None
+
             quality_metrics = evaluate_model_quality(
                 model=model,
                 model_name=metadata['model_name'],
+                model_cfg=metadata.get('model_cfg', {}),
                 dataset_cfg=metadata.get('dataset_cfg', {}),
                 n_samples=eval_n_samples,
                 batch_size=batch_size,
-                device=device
+                device=device,
+                metrics_calc=effective_metrics_calc,
             )
             if quality_metrics:
                 metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in quality_metrics.items()])
@@ -1964,6 +2034,17 @@ def main():
         default="dynamic",
         help="ONNX quantization type (default: dynamic)"
     )
+    parser.add_argument(
+        "--metrics-calc",
+        type=str,
+        choices=["full", "sampled"],
+        default=None,
+        help=(
+            "Metrics calculation mode. For SASRec, 'sampled' uses negative sampling "
+            "ranking metrics, 'full' uses the default dataset-based metrics. "
+            "If not set, SASRec uses 'sampled' by default while other models use their default."
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -1977,7 +2058,8 @@ def main():
         num_warmup=args.num_warmup,
         num_iterations=args.num_iterations,
         export_onnx=args.export_onnx,
-        onnx_quantization_type=args.onnx_quantization_type
+        onnx_quantization_type=args.onnx_quantization_type,
+        metrics_calc=args.metrics_calc,
     )
 
 
