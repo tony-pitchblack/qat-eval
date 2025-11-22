@@ -695,6 +695,17 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
         layer_type_counters = {"linear": 0, "conv2d": 0, "embedding": 0, "other": 0}
         best_per_layer_metrics: Dict[str, float] = {}
 
+        if metrics_eval_fn is not None:
+            try:
+                baseline_metrics = metrics_eval_fn(model)
+            except Exception:
+                baseline_metrics = {}
+            if baseline_metrics:
+                metrics_str = " ".join(
+                    f"{str(k)}={float(v):.4f}" for k, v in baseline_metrics.items()
+                )
+                print(f"[adaround] baseline_metrics {metrics_str}")
+
         layer_pbar = tqdm(self._layer_sequence, desc="adaround_model_layers", leave=True)
         for idx, (layer_name, layer_module) in enumerate(layer_pbar):
             layer_inputs, layer_outputs = self._collect_single_layer_io(
@@ -779,6 +790,14 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
                             best_per_layer_metrics[mk],
                             step=idx + 1,
                         )
+                    opt_metrics_str = " ".join(
+                        f"{str(mk)}={float(mv):.4f}"
+                        for mk, mv in last_metrics.items()
+                        if mv is not None
+                    )
+                    print(
+                        f"[adaround] layer={idx + 1} name={layer_name} opt_metrics {opt_metrics_str}"
+                    )
                 if metrics_eval_fn is not None:
                     try:
                         metric_values = metrics_eval_fn(model)
@@ -796,6 +815,14 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
                             f"max_adaround_per-layer_{mname}",
                             best_per_layer_metrics[mname],
                             step=idx + 1,
+                        )
+                    if metric_values:
+                        eval_metrics_str = " ".join(
+                            f"{str(mname)}={float(mval):.4f}"
+                            for mname, mval in metric_values.items()
+                        )
+                        print(
+                            f"[adaround] layer={idx + 1} name={layer_name} eval_metrics {eval_metrics_str}"
                         )
         
         model.eval()
