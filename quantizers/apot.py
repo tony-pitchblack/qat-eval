@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from ._base import BaseQuantizer, BaseQuantizerWrapper
 
 
@@ -10,42 +11,29 @@ class RCFFunction(torch.autograd.Function):
     
     @staticmethod
     def forward(ctx, x, alpha, levels, gamma, eps):
-        """
-        Forward: Ŵ = α · Π_Q(1,b)(clip(W/α, -1, 1))
-        Memory-efficient version with batching
-        """
         x_normalized = x / (alpha + eps)
         x_clipped = torch.clamp(x_normalized, -1.0, 1.0)
         
         levels_normalized = (levels * gamma).to(x.device)
         
-        # Memory-efficient: process in chunks to avoid OOM
+        # Memory-efficient projection
         original_shape = x_clipped.shape
         x_flat = x_clipped.reshape(-1)
         
-        # Process in batches of 10000 elements
         batch_size = 10000
         num_elements = x_flat.numel()
-        
-        # Create indices tensor with explicit size
         indices_list = []
         
         for i in range(0, num_elements, batch_size):
             end_idx = min(i + batch_size, num_elements)
             x_batch = x_flat[i:end_idx]
-            
-            # Compute distances for this batch only
-            x_exp = x_batch.unsqueeze(-1)  # [batch_size, 1]
-            levels_exp = levels_normalized.unsqueeze(0)  # [1, num_levels]
-            distances = torch.abs(x_exp - levels_exp)  # [batch_size, num_levels]
+            x_exp = x_batch.unsqueeze(-1)
+            levels_exp = levels_normalized.unsqueeze(0)
+            distances = torch.abs(x_exp - levels_exp)
             batch_indices = torch.argmin(distances, dim=-1)
             indices_list.append(batch_indices)
         
-        # Concatenate all indices
-        indices = torch.cat(indices_list, dim=0)
-        
-        # Reshape back to original shape
-        indices = indices.reshape(original_shape)
+        indices = torch.cat(indices_list, dim=0).reshape(original_shape)
         x_proj_normalized = levels_normalized[indices]
         
         output = x_proj_normalized * alpha
@@ -57,35 +45,22 @@ class RCFFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        Backward: Equation 8
-        
-        ∂Ŵ/∂W = 1 (STE for projection)
-        
-        ∂Ŵ/∂α = {
-            sign(W)              if |W| > α  (clipping)
-            Π(W/α) - W/α        if |W| ≤ α  (projection)
-        }
-        """
         x, alpha, x_normalized, x_proj_normalized = ctx.saved_tensors
-        eps = ctx.eps
         
         grad_x = grad_output.clone()
         
         outlier_mask = torch.abs(x) > alpha
-        
         grad_alpha_outlier = torch.sign(x) * outlier_mask.float()
         grad_alpha_inside = (x_proj_normalized - x_normalized) * (~outlier_mask).float()
         
         grad_alpha = (grad_alpha_outlier + grad_alpha_inside) * grad_output
-        grad_alpha = grad_alpha.sum()
-        grad_alpha = grad_alpha.view_as(alpha)
+        grad_alpha = grad_alpha.sum().view_as(alpha)
         
         return grad_x, grad_alpha, None, None, None
 
 
 class APoTQuantizer(BaseQuantizer):
-    """APoT Quantizer from "APoT: Efficient Non-Uniform Quantization" (ICLR 2020)"""
+    """APoT Quantizer with running statistics for stable inference"""
     
     def __init__(self, bit_width: int = 32, per_channel: bool = False, k: int = 2):
         super().__init__(bit_width=bit_width, per_channel=per_channel)
@@ -110,6 +85,10 @@ class APoTQuantizer(BaseQuantizer):
             self.gamma = 1.0
         
         self.alpha = nn.Parameter(torch.ones(1))
+        
+        self.register_buffer('running_mean', None)
+        self.register_buffer('running_var', None)
+        self.momentum = 0.1
     
     def _compute_gamma(self) -> float:
         max_level = 0.0
@@ -150,7 +129,6 @@ class APoTQuantizer(BaseQuantizer):
         generate_recursive(0, 0.0)
         
         positive_levels = sorted(levels_set)
-        
         if positive_levels[0] == 0.0:
             positive_levels = positive_levels[1:]
         
@@ -160,13 +138,43 @@ class APoTQuantizer(BaseQuantizer):
         return torch.tensor(all_levels, dtype=torch.float32)
     
     def weight_normalization(self, x: torch.Tensor) -> torch.Tensor:
+        """Weight normalization with running statistics (like BatchNorm)"""
+        
         if self.per_channel and x.dim() >= 2:
             dims = list(range(1, x.dim()))
-            mu = x.mean(dim=dims, keepdim=True)
-            var = x.var(dim=dims, keepdim=True, unbiased=False)
+            
+            if not self.training and self.running_mean is not None:
+                # Inference: use running stats
+                mu = self.running_mean
+                var = self.running_var
+            else:
+                # Training: compute stats
+                mu = x.mean(dim=dims, keepdim=True)
+                var = x.var(dim=dims, keepdim=True, unbiased=False)
+                
+                # Update running stats
+                if self.training:
+                    if self.running_mean is None:
+                        self.running_mean = mu.detach().clone()
+                        self.running_var = var.detach().clone()
+                    else:
+                        self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mu.detach()
+                        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.detach()
         else:
-            mu = x.mean()
-            var = x.var(unbiased=False)
+            if not self.training and self.running_mean is not None:
+                mu = self.running_mean
+                var = self.running_var
+            else:
+                mu = x.mean()
+                var = x.var(unbiased=False)
+                
+                if self.training:
+                    if self.running_mean is None:
+                        self.running_mean = mu.detach().clone()
+                        self.running_var = var.detach().clone()
+                    else:
+                        self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mu.detach()
+                        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.detach()
         
         sigma = torch.sqrt(var + self.eps)
         return (x - mu) / sigma
@@ -502,6 +510,42 @@ class APoTMultiheadAttention(nn.Module):
         return attn_output, attn_output_weights
 
 
+class APoTLinearInference(nn.Module):
+    """Inference Linear with frozen quantized weights"""
+    
+    def __init__(self, weight, bias):
+        super().__init__()
+        self.register_buffer('weight', weight)
+        if bias is not None:
+            self.register_buffer('bias', bias)
+        else:
+            self.bias = None
+    
+    def forward(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+
+class APoTConv2dInference(nn.Module):
+    """Inference Conv2d with frozen quantized weights"""
+    
+    def __init__(self, weight, bias, stride, padding, dilation, groups):
+        super().__init__()
+        self.register_buffer('weight', weight)
+        if bias is not None:
+            self.register_buffer('bias', bias)
+        else:
+            self.bias = None
+        
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+    
+    def forward(self, x):
+        return F.conv2d(x, self.weight, self.bias, self.stride,
+                       self.padding, self.dilation, self.groups)
+
+
 class APoTQuantizerWrapper(BaseQuantizerWrapper):
     """Wrapper to apply APoT quantization to entire model"""
     
@@ -510,119 +554,84 @@ class APoTQuantizerWrapper(BaseQuantizerWrapper):
         self.k = k
     
     def prepare_qat_model(self, model: nn.Module) -> nn.Module:
+        """Prepare model for QAT training"""
         for name, module in list(model.named_children()):
             if isinstance(module, nn.MultiheadAttention):
-                setattr(
-                    model,
-                    name,
-                    APoTMultiheadAttention(
-                        module, 
-                        bit_width=self._quantizer.bit_width, 
-                        k=self.k
-                    )
-                )
+                setattr(model, name, APoTMultiheadAttention(
+                    module, bit_width=self._quantizer.bit_width, k=self.k
+                ))
             elif isinstance(module, nn.Linear):
-                setattr(
-                    model,
-                    name,
-                    APoTLinear(
-                        module, 
-                        bit_width=self._quantizer.bit_width, 
-                        k=self.k
-                    )
-                )
+                setattr(model, name, APoTLinear(
+                    module, bit_width=self._quantizer.bit_width, k=self.k
+                ))
             elif isinstance(module, nn.Conv2d):
-                setattr(
-                    model,
-                    name,
-                    APoTConv2d(
-                        module, 
-                        bit_width=self._quantizer.bit_width, 
-                        k=self.k
-                    )
-                )
+                setattr(model, name, APoTConv2d(
+                    module, bit_width=self._quantizer.bit_width, k=self.k
+                ))
             elif isinstance(module, nn.Embedding):
-                setattr(
-                    model,
-                    name,
-                    APoTEmbedding(
-                        module, 
-                        bit_width=self._quantizer.bit_width, 
-                        k=self.k
-                    )
-                )
+                setattr(model, name, APoTEmbedding(
+                    module, bit_width=self._quantizer.bit_width, k=self.k
+                ))
             elif isinstance(module, nn.LayerNorm):
-                setattr(
-                    model,
-                    name,
-                    APoTLayerNorm(
-                        module, 
-                        bit_width=self._quantizer.bit_width, 
-                        k=self.k
-                    )
-                )
+                setattr(model, name, APoTLayerNorm(
+                    module, bit_width=self._quantizer.bit_width, k=self.k
+                ))
             else:
                 self.prepare_qat_model(module)
-        
         return model
     
     def prepare_for_inference(self, model: nn.Module, **kwargs) -> nn.Module:
-        """Convert APoT quantized layers to standard layers with quantized weights"""
+        """Convert APoT model to inference mode with frozen quantized weights"""
         print("Converting APoT model to inference mode...")
         
         def convert_module(module):
             for name, child in list(module.named_children()):
                 if isinstance(child, APoTConv2d):
-                    # Quantize weights once
+                    # Set to eval mode for running stats
+                    child.weight_quant.eval()
+                    child.bias_quant.eval()
+                    
+                    # Quantize weights once using running stats
                     with torch.no_grad():
                         q_weight = child.weight_quant(child.conv.weight, is_weight=True)
                         q_bias = None
                         if child.conv.bias is not None:
                             q_bias = child.bias_quant(child.conv.bias, is_weight=False)
                     
-                    # Create standard Conv2d with quantized weights
-                    new_layer = nn.Conv2d(
-                        in_channels=child.conv.in_channels,
-                        out_channels=child.conv.out_channels,
-                        kernel_size=child.conv.kernel_size,
+                    # Create simple inference layer
+                    new_layer = APoTConv2dInference(
+                        weight=q_weight,
+                        bias=q_bias,
                         stride=child.conv.stride,
                         padding=child.conv.padding,
                         dilation=child.conv.dilation,
-                        groups=child.conv.groups,
-                        bias=child.conv.bias is not None
+                        groups=child.conv.groups
                     )
-                    new_layer.weight.data = q_weight
-                    if q_bias is not None:
-                        new_layer.bias.data = q_bias
                     
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, APoTLinear):
-                    # Quantize weights once
+                    child.weight_quant.eval()
+                    child.bias_quant.eval()
+                    
                     with torch.no_grad():
                         q_weight = child.weight_quant(child.fc.weight, is_weight=True)
                         q_bias = None
                         if child.fc.bias is not None:
                             q_bias = child.bias_quant(child.fc.bias, is_weight=False)
                     
-                    # Create standard Linear with quantized weights
-                    new_layer = nn.Linear(
-                        in_features=child.fc.in_features,
-                        out_features=child.fc.out_features,
-                        bias=child.fc.bias is not None
+                    new_layer = APoTLinearInference(
+                        weight=q_weight,
+                        bias=q_bias
                     )
-                    new_layer.weight.data = q_weight
-                    if q_bias is not None:
-                        new_layer.bias.data = q_bias
                     
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, APoTEmbedding):
-                    # Quantize embedding weights once
+                    child.weight_quant.eval()
                     with torch.no_grad():
                         q_weight = child.weight_quant(child.emb.weight, is_weight=True)
                     
-                    # Create standard Embedding with quantized weights
                     new_layer = nn.Embedding(
                         num_embeddings=child.emb.num_embeddings,
                         embedding_dim=child.emb.embedding_dim,
@@ -633,11 +642,12 @@ class APoTQuantizerWrapper(BaseQuantizerWrapper):
                         sparse=child.emb.sparse
                     )
                     new_layer.weight.data = q_weight
-                    
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, APoTLayerNorm):
-                    # Quantize LayerNorm parameters once
+                    child.weight_quant.eval()
+                    child.bias_quant.eval()
+                    
                     with torch.no_grad():
                         q_weight = child.ln.weight
                         q_bias = child.ln.bias
@@ -646,7 +656,6 @@ class APoTQuantizerWrapper(BaseQuantizerWrapper):
                         if q_bias is not None:
                             q_bias = child.bias_quant(q_bias, is_weight=False)
                     
-                    # Create standard LayerNorm with quantized parameters
                     new_layer = nn.LayerNorm(
                         normalized_shape=child.ln.normalized_shape,
                         eps=child.ln.eps
@@ -655,13 +664,7 @@ class APoTQuantizerWrapper(BaseQuantizerWrapper):
                         new_layer.weight.data = q_weight
                     if q_bias is not None:
                         new_layer.bias.data = q_bias
-                    
                     setattr(module, name, new_layer)
-                    
-                elif isinstance(child, APoTMultiheadAttention):
-                    # For MultiheadAttention, keep the quantized version for now
-                    # (complex to convert fully)
-                    pass
                     
                 else:
                     convert_module(child)

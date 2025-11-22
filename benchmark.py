@@ -218,7 +218,7 @@ def load_model_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[n
             print(f"Warning: Could not prepare quantized model structure: {e}")
     
     # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model = model.to(device)
     model.eval()
     

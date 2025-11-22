@@ -409,186 +409,82 @@ class APoTONNXConverter(ONNXConverter):
     def __init__(self, model_name: str):
         super().__init__(model_name, 'APoT')
     
-    def quantize_to_indices(self, weight: torch.Tensor, levels: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
-        """Quantize weights to indices in levels array for lookup table"""
-        levels_normalized = levels * gamma
-        weight_normalized = weight.cpu().numpy() / alpha
-        weight_clipped = np.clip(weight_normalized, -1.0, 1.0)
-        
-        # Find nearest level index
-        indices = np.zeros(weight_clipped.shape, dtype=np.int64)
-        weight_flat = weight_clipped.flatten()
-        
-        for i, w in enumerate(weight_flat):
-            distances = np.abs(levels_normalized - w)
-            indices.flat[i] = np.argmin(distances)
-        
-        return indices
-    
     def prepare_model_for_export(self, model: nn.Module) -> nn.Module:
-        """Convert APoT layers to lookup table representation for ONNX"""
-        from quantizers.apot import APoTConv2d, APoTLinear, APoTEmbedding, APoTLayerNorm
-        
-        class APoTLinearONNX(nn.Module):
-            """ONNX-compatible APoT Linear using Gather operation"""
-            
-            def __init__(self, indices, levels, alpha, gamma, bias, in_features, out_features):
-                super().__init__()
-                
-                # Register as buffers for ONNX export
-                self.register_buffer('indices', torch.from_numpy(indices).long())
-                self.register_buffer('levels', torch.from_numpy(levels).float())
-                self.register_buffer('alpha', torch.tensor([alpha]).float())
-                self.register_buffer('gamma', torch.tensor([gamma]).float())
-                
-                if bias is not None:
-                    self.register_buffer('bias', bias)
-                else:
-                    self.bias = None
-                
-                self.in_features = in_features
-                self.out_features = out_features
-            
-            def forward(self, x):
-                # Reconstruct weights using Gather (ONNX-efficient)
-                levels_normalized = self.levels * self.gamma
-                
-                # Gather operation - supported natively by ONNX
-                flat_indices = self.indices.flatten()
-                weight_flat = torch.gather(
-                    levels_normalized.unsqueeze(0).expand(len(flat_indices), -1),
-                    1,
-                    flat_indices.unsqueeze(1)
-                ).squeeze(1)
-                
-                weight = weight_flat.reshape(self.indices.shape) * self.alpha
-                
-                return F.linear(x, weight, self.bias)
-        
-        class APoTConv2dONNX(nn.Module):
-            """ONNX-compatible APoT Conv2d using Gather operation"""
-            
-            def __init__(self, indices, levels, alpha, gamma, bias, conv_params):
-                super().__init__()
-                
-                self.register_buffer('indices', torch.from_numpy(indices).long())
-                self.register_buffer('levels', torch.from_numpy(levels).float())
-                self.register_buffer('alpha', torch.tensor([alpha]).float())
-                self.register_buffer('gamma', torch.tensor([gamma]).float())
-                
-                if bias is not None:
-                    self.register_buffer('bias', bias)
-                else:
-                    self.bias = None
-                
-                self.conv_params = conv_params
-            
-            def forward(self, x):
-                # Reconstruct weights using Gather
-                levels_normalized = self.levels * self.gamma
-                flat_indices = self.indices.flatten()
-                weight_flat = torch.gather(
-                    levels_normalized.unsqueeze(0).expand(len(flat_indices), -1),
-                    1,
-                    flat_indices.unsqueeze(1)
-                ).squeeze(1)
-                
-                weight = weight_flat.reshape(self.indices.shape) * self.alpha
-                
-                return F.conv2d(
-                    x, weight, self.bias,
-                    stride=self.conv_params['stride'],
-                    padding=self.conv_params['padding'],
-                    dilation=self.conv_params['dilation'],
-                    groups=self.conv_params['groups']
-                )
-        
-        def convert_module(module):
-            for name, child in list(module.named_children()):
-                if isinstance(child, APoTLinear):
-                    # Extract APoT parameters
-                    quantizer = child.weight_quant
-                    weight = child.fc.weight.data
-                    
-                    # Quantize to indices
-                    indices = self.quantize_to_indices(
-                        weight,
-                        quantizer.levels.cpu().numpy() if hasattr(quantizer, 'levels') and quantizer.levels is not None else np.linspace(-1, 1, 256),
-                        quantizer.alpha.item() if hasattr(quantizer, 'alpha') else 1.0,
-                        quantizer.gamma if hasattr(quantizer, 'gamma') else 1.0
-                    )
-                    
-                    # Create ONNX-compatible layer with lookup table
-                    new_layer = APoTLinearONNX(
-                        indices=indices,
-                        levels=quantizer.levels.cpu().numpy() if hasattr(quantizer, 'levels') and quantizer.levels is not None else np.linspace(-1, 1, 256),
-                        alpha=quantizer.alpha.item() if hasattr(quantizer, 'alpha') else 1.0,
-                        gamma=quantizer.gamma if hasattr(quantizer, 'gamma') else 1.0,
-                        bias=child.fc.bias.data if child.fc.bias is not None else None,
-                        in_features=child.fc.in_features,
-                        out_features=child.fc.out_features
-                    )
-                    setattr(module, name, new_layer)
-                    
-                elif isinstance(child, APoTConv2d):
-                    # Extract APoT parameters
-                    quantizer = child.weight_quant
-                    weight = child.conv.weight.data
-                    
-                    # Quantize to indices
-                    indices = self.quantize_to_indices(
-                        weight,
-                        quantizer.levels.cpu().numpy() if hasattr(quantizer, 'levels') and quantizer.levels is not None else np.linspace(-1, 1, 256),
-                        quantizer.alpha.item() if hasattr(quantizer, 'alpha') else 1.0,
-                        quantizer.gamma if hasattr(quantizer, 'gamma') else 1.0
-                    )
-                    
-                    # Create ONNX-compatible layer
-                    conv_params = {
-                        'stride': child.conv.stride,
-                        'padding': child.conv.padding,
-                        'dilation': child.conv.dilation,
-                        'groups': child.conv.groups
-                    }
-                    
-                    new_layer = APoTConv2dONNX(
-                        indices=indices,
-                        levels=quantizer.levels.cpu().numpy() if hasattr(quantizer, 'levels') and quantizer.levels is not None else np.linspace(-1, 1, 256),
-                        alpha=quantizer.alpha.item() if hasattr(quantizer, 'alpha') else 1.0,
-                        gamma=quantizer.gamma if hasattr(quantizer, 'gamma') else 1.0,
-                        bias=child.conv.bias.data if child.conv.bias is not None else None,
-                        conv_params=conv_params
-                    )
-                    setattr(module, name, new_layer)
-                    
-                elif isinstance(child, APoTEmbedding):
-                    # Embeddings: use quantized weights directly
-                    with torch.no_grad():
-                        q_weight = child.weight_quant(child.emb.weight, is_weight=True)
-                    
-                    new_layer = nn.Embedding(
-                        num_embeddings=child.emb.num_embeddings,
-                        embedding_dim=child.emb.embedding_dim,
-                        padding_idx=child.emb.padding_idx
-                    )
-                    new_layer.weight.data = q_weight
-                    setattr(module, name, new_layer)
-                    
-                elif isinstance(child, APoTLayerNorm):
-                    # LayerNorm: keep in FP32
-                    new_layer = nn.LayerNorm(
-                        normalized_shape=child.ln.normalized_shape,
-                        eps=child.ln.eps
-                    )
-                    new_layer.weight.data = child.ln.weight.data
-                    if child.ln.bias is not None:
-                        new_layer.bias.data = child.ln.bias.data
-                    setattr(module, name, new_layer)
-                else:
-                    convert_module(child)
-        
-        convert_module(model)
+        """Model should already be converted by prepare_for_inference"""
         return model
+    
+    def convert_to_onnx_int8(
+        self,
+        model: nn.Module,
+        dummy_input: torch.Tensor,
+        output_dir: str,
+        calibration_loader: Optional[Any] = None,
+        quantization_type: str = 'dynamic'
+    ) -> Tuple[str, str]:
+        """Export APoT model to ONNX FP32 and INT8 formats"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"[{self.quantizer_name}] Step 1: Exporting to ONNX FP32...")
+        fp32_path = os.path.join(output_dir, f'{self.model_name}_{self.quantizer_name}_fp32.onnx')
+        
+        model.eval()
+        model.cpu()
+        dummy_input = dummy_input.cpu()
+        
+        torch.onnx.export(
+            model,
+            dummy_input,
+            fp32_path,
+            export_params=True,
+            opset_version=13,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
+            dynamo=False
+        )
+        
+        print(f"[{self.quantizer_name}] FP32 ONNX saved: {fp32_path}")
+        
+        print(f"[{self.quantizer_name}] Step 2: Applying ONNX INT8 quantization...")
+        int8_path = os.path.join(output_dir, f'{self.model_name}_{self.quantizer_name}_int8.onnx')
+        
+        if quantization_type == 'dynamic':
+            quantize_dynamic(
+                model_input=fp32_path,
+                model_output=int8_path,
+                weight_type=QuantType.QInt8
+            )
+        elif quantization_type == 'static':
+            if calibration_loader is None:
+                raise ValueError("calibration_loader required for static quantization")
+            
+            calibration_reader = ONNXCalibrationDataReader(
+                calibration_loader,
+                input_name='input',
+                max_samples=100
+            )
+            
+            quantize_static(
+                model_input=fp32_path,
+                model_output=int8_path,
+                calibration_data_reader=calibration_reader,
+                activation_type=QuantType.QUInt8,
+                weight_type=QuantType.QInt8
+            )
+        else:
+            raise ValueError(f"Unknown quantization_type: {quantization_type}")
+        
+        print(f"[{self.quantizer_name}] INT8 ONNX saved: {int8_path}")
+        
+        try:
+            onnx_model = onnx.load(int8_path)
+            onnx.checker.check_model(onnx_model)
+            print(f"[{self.quantizer_name}] ONNX model validated")
+        except Exception as e:
+            print(f"[{self.quantizer_name}] Warning: ONNX validation failed: {e}")
+        
+        return fp32_path, int8_path
 
 
 class LSQONNXConverter(ONNXConverter):
