@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import copy
+import datetime
 
 import pandas as pd
 import torch
@@ -184,15 +185,47 @@ def _finalize_model_size(
     return model
 
 
+_RUN_SAVE_DIRS: Dict[str, str] = {}
+
+
+def _get_run_save_dir(run_name: str) -> str:
+    if not run_name:
+        run_name = "run"
+    if run_name in _RUN_SAVE_DIRS:
+        return _RUN_SAVE_DIRS[run_name]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_run_name = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in run_name)
+    dir_path = os.path.join("models", f"{timestamp}_{safe_run_name}")
+    os.makedirs(dir_path, exist_ok=True)
+    _RUN_SAVE_DIRS[run_name] = dir_path
+    return dir_path
+
+
 def _save_model_artifact(
     model: torch.nn.Module,
     mlflow_client=None,
     filename: str = "model_after_ptq.pt",
+    run_name: Optional[str] = None,
 ) -> None:
     try:
-        torch.save(model.state_dict(), filename)
         if mlflow_client is not None:
-            mlflow_client.log_artifact(filename)
+            import tempfile
+
+            base, ext = os.path.splitext(filename)
+            fd, tmp_path = tempfile.mkstemp(prefix=base + "_", suffix=ext or ".pt")
+            os.close(fd)
+            try:
+                torch.save(model.state_dict(), tmp_path)
+                mlflow_client.log_artifact(tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        else:
+            save_dir = _get_run_save_dir(run_name or "run")
+            out_path = os.path.join(save_dir, filename)
+            torch.save(model.state_dict(), out_path)
     except Exception:
         pass
 
@@ -1305,6 +1338,23 @@ def main():
                 best_val_metrics: Dict[str, float] = {}
                 eval_mode = "sampled" if args.metrics_calc == "sampled" else "full"
 
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
+                    "quantizer_optimizer": quantizer_opt_cfg,
+                }
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
+
                 total_epochs = int(train_cfg.get("epochs", 1))
                 if not args.from_pretrained:
                     for ep in range(total_epochs):
@@ -1379,6 +1429,7 @@ def main():
                         model_obj,
                         mlflow_client=None,
                         filename="model_after_qat.pt",
+                        run_name=run_name,
                     )
 
                 if quantizer_wrapper is not None:
@@ -1394,10 +1445,10 @@ def main():
                             optimize_kwargs[k] = quantizer_opt_cfg[k]
                     model_obj = quantizer_wrapper.optimize_ptq(**optimize_kwargs)
                     model_obj = _finalize_model_size(model_obj, quantizer_wrapper, mlflow_client=None)
-                    _save_model_artifact(model_obj, mlflow_client=None)
+                    _save_model_artifact(model_obj, mlflow_client=None, run_name=run_name)
                 else:
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
-                    _save_model_artifact(model_obj, mlflow_client=None)
+                    _save_model_artifact(model_obj, mlflow_client=None, run_name=run_name)
     elif args.model == "simple_cnn":
         metrics_cfg = model_name_to_metrics.get(args.model)
         if not metrics_cfg:
@@ -1513,6 +1564,22 @@ def main():
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
                     _save_model_artifact(model_obj, mlflow_client=mlflow_client)
             else:
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
+                }
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                dataset_for_run = dataset_cfg.get("dataset")
+                base_name = f"{args.model}-{args.quantizer}"
+                if dataset_for_run:
+                    base_name = f"{args.model}-{dataset_for_run}-{args.quantizer}"
+                run_name = f"{base_name}-{hash_int:06d}"
+
                 fit_simple_cnn(
                     model_obj,
                     quantizer_obj,
@@ -1524,7 +1591,7 @@ def main():
                     device,
                 )
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
-                _save_model_artifact(model_obj, mlflow_client=None)
+                _save_model_artifact(model_obj, mlflow_client=None, run_name=run_name)
     elif args.model == "lstm":
         metrics_cfg = model_name_to_metrics.get(args.model)
         if not metrics_cfg:
@@ -1650,6 +1717,18 @@ def main():
                     model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=mlflow_client)
                     _save_model_artifact(model_obj, mlflow_client=mlflow_client)
             else:
+                run_config = {
+                    "model": args.model,
+                    "quantizer": args.quantizer,
+                    "model_cfg": model_cfg,
+                    "dataset_cfg": dataset_cfg,
+                    "train_cfg": train_cfg,
+                    "quantizer_cfg": quantizer_cfg,
+                }
+                config_str = json.dumps(run_config, sort_keys=True, default=str)
+                hash_int = int(hashlib.md5(config_str.encode("utf-8")).hexdigest(), 16) % 1_000_000
+                run_name = f"{args.model}-{args.quantizer}-{hash_int:06d}"
+
                 fit_lstm(
                     model_obj,
                     quantizer_obj,
@@ -1661,7 +1740,7 @@ def main():
                     device,
                 )
                 model_obj = _finalize_model_size(model_obj, quantizer_obj, mlflow_client=None)
-                _save_model_artifact(model_obj, mlflow_client=None)
+                _save_model_artifact(model_obj, mlflow_client=None, run_name=run_name)
 
 
 if __name__ == "__main__":
