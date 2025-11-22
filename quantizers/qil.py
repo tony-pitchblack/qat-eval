@@ -564,6 +564,3 @@ class QILQuantizerWrapper(BaseQuantizerWrapper):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
-
-    def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
-        return model
