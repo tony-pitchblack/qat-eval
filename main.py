@@ -20,17 +20,17 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 from models.sasrec import SASRecModel
-from datasets.next_item_dataset import NextItemDataset
+from data_modules.next_item_dataset import NextItemDataset
 from models.simple_cnn import SimpleCNN
-from datasets.mnist_dataset import MNISTDataset
+from data_modules.mnist_dataset import MNISTDataset
 from metrics import model_name_to_metrics
-from datasets.masked_seq_dataset import MaskedSeqDataset, load_tifuknn_dfs, build_sequences_from_df, get_tifuknn_paths
+from data_modules.masked_seq_dataset import MaskedSeqDataset, load_tifuknn_dfs, build_sequences_from_df, get_tifuknn_paths
 
 from models.lstm import LSTMModel
-from datasets.imdb_dataset import IMDBDataset
+from data_modules.imdb_dataset import IMDBDataset
 
 from models.espcn import ESPCNModel
-from datasets.dummy_espcn_dataset import DummyESPCNDataset
+from data_modules.dummy_espcn_dataset import DummyESPCNDataset
 
 from quantizers._base import BaseQuantizerWrapper
 
