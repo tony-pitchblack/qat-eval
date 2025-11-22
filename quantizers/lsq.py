@@ -158,6 +158,101 @@ class LSQLayerNorm(nn.Module):
         return F.layer_norm(x, self.ln.normalized_shape, weight, bias, self.ln.eps)
 
 
+class LSQLSTM(nn.Module):
+    def __init__(self, lstm: nn.LSTM, bit_width: int):
+        super().__init__()
+        self.lstm = lstm
+        
+        # Store LSTM attributes
+        self.input_size = lstm.input_size
+        self.hidden_size = lstm.hidden_size
+        self.num_layers = lstm.num_layers
+        self.bias = lstm.bias
+        self.batch_first = lstm.batch_first
+        self.dropout = lstm.dropout
+        self.bidirectional = lstm.bidirectional
+        
+        # Create quantizers for each layer's weights
+        self.weight_quantizers = nn.ModuleDict()
+        
+        num_directions = 2 if self.bidirectional else 1
+        
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                
+                # Quantizers for input-hidden and hidden-hidden weights
+                self.weight_quantizers[f"{prefix}_ih"] = LSQQuantizer(bit_width=bit_width)
+                self.weight_quantizers[f"{prefix}_hh"] = LSQQuantizer(bit_width=bit_width)
+                
+                # Initialize quantizers from actual weights
+                with torch.no_grad():
+                    weight_ih = getattr(lstm, f'weight_ih_l{layer}{suffix}')
+                    weight_hh = getattr(lstm, f'weight_hh_l{layer}{suffix}')
+                    self.weight_quantizers[f"{prefix}_ih"].init_from(weight_ih)
+                    self.weight_quantizers[f"{prefix}_hh"].init_from(weight_hh)
+                
+                # Bias quantizers if bias is used
+                if self.bias:
+                    self.weight_quantizers[f"{prefix}_ih_bias"] = LSQQuantizer(bit_width=bit_width)
+                    self.weight_quantizers[f"{prefix}_hh_bias"] = LSQQuantizer(bit_width=bit_width)
+                    with torch.no_grad():
+                        bias_ih = getattr(lstm, f'bias_ih_l{layer}{suffix}')
+                        bias_hh = getattr(lstm, f'bias_hh_l{layer}{suffix}')
+                        self.weight_quantizers[f"{prefix}_ih_bias"].init_from(bias_ih)
+                        self.weight_quantizers[f"{prefix}_hh_bias"].init_from(bias_hh)
+    
+    def forward(self, input, hx=None):
+        # Quantize all LSTM weights
+        num_directions = 2 if self.bidirectional else 1
+        
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                
+                # Get original weights
+                weight_ih = getattr(self.lstm, f'weight_ih_l{layer}{suffix}')
+                weight_hh = getattr(self.lstm, f'weight_hh_l{layer}{suffix}')
+                
+                # Quantize and replace
+                q_weight_ih = self.weight_quantizers[f"{prefix}_ih"](weight_ih)
+                q_weight_hh = self.weight_quantizers[f"{prefix}_hh"](weight_hh)
+                
+                # Temporarily replace weights (for forward pass)
+                setattr(self.lstm, f'weight_ih_l{layer}{suffix}', nn.Parameter(q_weight_ih))
+                setattr(self.lstm, f'weight_hh_l{layer}{suffix}', nn.Parameter(q_weight_hh))
+                
+                if self.bias:
+                    bias_ih = getattr(self.lstm, f'bias_ih_l{layer}{suffix}')
+                    bias_hh = getattr(self.lstm, f'bias_hh_l{layer}{suffix}')
+                    q_bias_ih = self.weight_quantizers[f"{prefix}_ih_bias"](bias_ih)
+                    q_bias_hh = self.weight_quantizers[f"{prefix}_hh_bias"](bias_hh)
+                    setattr(self.lstm, f'bias_ih_l{layer}{suffix}', nn.Parameter(q_bias_ih))
+                    setattr(self.lstm, f'bias_hh_l{layer}{suffix}', nn.Parameter(q_bias_hh))
+        
+        # Forward through LSTM with quantized weights
+        output, hx = self.lstm(input, hx)
+        
+        # Restore original weights (to maintain gradient flow)
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                weight_ih = getattr(self.lstm, f'weight_ih_l{layer}{suffix}')
+                weight_hh = getattr(self.lstm, f'weight_hh_l{layer}{suffix}')
+                setattr(self.lstm, f'weight_ih_l{layer}{suffix}', nn.Parameter(weight_ih.data))
+                setattr(self.lstm, f'weight_hh_l{layer}{suffix}', nn.Parameter(weight_hh.data))
+                
+                if self.bias:
+                    bias_ih = getattr(self.lstm, f'bias_ih_l{layer}{suffix}')
+                    bias_hh = getattr(self.lstm, f'bias_hh_l{layer}{suffix}')
+                    setattr(self.lstm, f'bias_ih_l{layer}{suffix}', nn.Parameter(bias_ih.data))
+                    setattr(self.lstm, f'bias_hh_l{layer}{suffix}', nn.Parameter(bias_hh.data))
+        
+        return output, hx
+
+
 class LSQMultiheadAttention(nn.Module):
     def __init__(self, attn: nn.MultiheadAttention, bit_width: int):
         super().__init__()
@@ -313,6 +408,8 @@ class LSQQuantizerWrapper(BaseQuantizerWrapper):
         for name, module in list(model.named_children()):
             if isinstance(module, nn.MultiheadAttention):
                 setattr(model, name, LSQMultiheadAttention(module, bit_width=self._quantizer.bit_width))
+            elif isinstance(module, nn.LSTM):
+                setattr(model, name, LSQLSTM(module, bit_width=self._quantizer.bit_width))
             elif isinstance(module, nn.Linear):
                 setattr(model, name, LSQLinear(module, bit_width=self._quantizer.bit_width))
             elif isinstance(module, nn.Conv2d):
@@ -414,6 +511,49 @@ class LSQQuantizerWrapper(BaseQuantizerWrapper):
                         new_layer.weight.data = q_weight
                     if q_bias is not None:
                         new_layer.bias.data = q_bias
+                    
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQLSTM):
+                    # Quantize LSTM weights once
+                    with torch.no_grad():
+                        num_directions = 2 if child.bidirectional else 1
+                        
+                        # Create a new LSTM with the same parameters
+                        new_layer = nn.LSTM(
+                            input_size=child.input_size,
+                            hidden_size=child.hidden_size,
+                            num_layers=child.num_layers,
+                            bias=child.bias,
+                            batch_first=child.batch_first,
+                            dropout=child.dropout,
+                            bidirectional=child.bidirectional
+                        )
+                        
+                        # Copy quantized weights
+                        for layer in range(child.num_layers):
+                            for direction in range(num_directions):
+                                suffix = f"_reverse" if direction == 1 else ""
+                                prefix = f"l{layer}{suffix}"
+                                
+                                # Get and quantize weights
+                                weight_ih = getattr(child.lstm, f'weight_ih_l{layer}{suffix}')
+                                weight_hh = getattr(child.lstm, f'weight_hh_l{layer}{suffix}')
+                                
+                                q_weight_ih = child.weight_quantizers[f"{prefix}_ih"](weight_ih)
+                                q_weight_hh = child.weight_quantizers[f"{prefix}_hh"](weight_hh)
+                                
+                                # Set quantized weights
+                                getattr(new_layer, f'weight_ih_l{layer}{suffix}').data = q_weight_ih
+                                getattr(new_layer, f'weight_hh_l{layer}{suffix}').data = q_weight_hh
+                                
+                                if child.bias:
+                                    bias_ih = getattr(child.lstm, f'bias_ih_l{layer}{suffix}')
+                                    bias_hh = getattr(child.lstm, f'bias_hh_l{layer}{suffix}')
+                                    q_bias_ih = child.weight_quantizers[f"{prefix}_ih_bias"](bias_ih)
+                                    q_bias_hh = child.weight_quantizers[f"{prefix}_hh_bias"](bias_hh)
+                                    getattr(new_layer, f'bias_ih_l{layer}{suffix}').data = q_bias_ih
+                                    getattr(new_layer, f'bias_hh_l{layer}{suffix}').data = q_bias_hh
                     
                     setattr(module, name, new_layer)
                     

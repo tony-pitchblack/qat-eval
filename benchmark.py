@@ -449,7 +449,7 @@ def plot_onnx_weight_distributions(results: List[Dict[str, Any]], output_dir: st
 
 def _convert_adaround_to_standard_layers(model: nn.Module) -> nn.Module:
     """Convert AdaRound quantized layers to standard layers with quantized weights"""
-    from quantizers.adaround import AdaRoundConv2d, AdaRoundLinear, AdaRoundEmbedding, AdaRoundLayerNorm
+    from quantizers.adaround import AdaRoundConv2d, AdaRoundLinear, AdaRoundEmbedding, AdaRoundLayerNorm, AdaRoundLSTM
     
     def convert_module(module):
         for name, child in list(module.named_children()):
@@ -514,6 +514,48 @@ def _convert_adaround_to_standard_layers(model: nn.Module) -> nn.Module:
                     sparse=child.emb.sparse
                 )
                 new_layer.weight.data = q_weight
+                
+                setattr(module, name, new_layer)
+                
+            elif isinstance(child, AdaRoundLSTM):
+                # Quantize LSTM weights once
+                with torch.no_grad():
+                    num_directions = 2 if child.bidirectional else 1
+                    
+                    # Create a new LSTM with the same parameters
+                    new_layer = nn.LSTM(
+                        input_size=child.input_size,
+                        hidden_size=child.hidden_size,
+                        num_layers=child.num_layers,
+                        bias=child.bias,
+                        batch_first=child.batch_first,
+                        dropout=child.dropout,
+                        bidirectional=child.bidirectional
+                    )
+                    
+                    # Copy quantized weights
+                    for layer in range(child.num_layers):
+                        for direction in range(num_directions):
+                            suffix = f"_reverse" if direction == 1 else ""
+                            prefix = f"l{layer}{suffix}"
+                            
+                            # Get and quantize weights
+                            weight_ih = getattr(child.lstm, f'weight_ih_l{layer}{suffix}')
+                            weight_hh = getattr(child.lstm, f'weight_hh_l{layer}{suffix}')
+                            
+                            q_weight_ih = child.weight_quantizers[f"{prefix}_ih"].get_quantized_weight(weight_ih)
+                            q_weight_hh = child.weight_quantizers[f"{prefix}_hh"].get_quantized_weight(weight_hh)
+                            
+                            # Set quantized weights
+                            getattr(new_layer, f'weight_ih_l{layer}{suffix}').data = q_weight_ih
+                            getattr(new_layer, f'weight_hh_l{layer}{suffix}').data = q_weight_hh
+                            
+                            # Biases are not quantized in AdaRound typically
+                            if child.bias:
+                                bias_ih = getattr(child.lstm, f'bias_ih_l{layer}{suffix}')
+                                bias_hh = getattr(child.lstm, f'bias_hh_l{layer}{suffix}')
+                                getattr(new_layer, f'bias_ih_l{layer}{suffix}').data = bias_ih
+                                getattr(new_layer, f'bias_hh_l{layer}{suffix}').data = bias_hh
                 
                 setattr(module, name, new_layer)
                 

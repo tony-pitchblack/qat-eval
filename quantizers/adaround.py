@@ -385,6 +385,90 @@ class AdaRoundOptimizer:
             rounding = (h_V_final > 0.5).float()
         
         return rounding
+    
+    def optimize_lstm_weight(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        thd_neg: float,
+        thd_pos: float,
+        input_activations: List[torch.Tensor],
+        target_outputs: List[torch.Tensor],
+        log_callback: Optional[Callable[[int, float, float, float], None]] = None,
+    ) -> torch.Tensor:
+        """Optimize rounding for LSTM weight matrix using reconstruction loss"""
+        device = weight.device
+        
+        # Initialize V from fractional part
+        with torch.no_grad():
+            w_scaled = weight / scale
+            w_floor = torch.floor(w_scaled)
+            frac = w_scaled - w_floor
+            frac = torch.clamp(frac, 0.01, 0.99)
+            V = torch.log(frac / (1 - frac)) / (self.zeta - self.gamma) - \
+                self.gamma / (self.zeta - self.gamma)
+        
+        V = nn.Parameter(V.to(device))
+        optimizer = torch.optim.Adam([V], lr=self.lr)
+        
+        # Beta annealing schedule
+        beta_decay = (self.beta_start / self.beta_end) ** (1 / self.num_iterations)
+        current_beta = self.beta_start
+        
+        # Create batches
+        input_batches = self._create_batches(input_activations)
+        output_batches = self._create_batches(target_outputs)
+        
+        # Optimization loop
+        pbar = tqdm(range(self.num_iterations), desc="adaround_lstm_weight", leave=False)
+        for iteration in pbar:
+            for input_batch, output_batch in zip(input_batches, output_batches):
+                optimizer.zero_grad()
+                
+                # Stack batch
+                x_batch = torch.stack([x.to(device) for x in input_batch])
+                target_batch = torch.stack([y.to(device) for y in output_batch])
+                
+                # Soft quantization
+                h_V = self.rectified_sigmoid(V)
+                w_soft = w_floor + h_V
+                w_quant = torch.clamp(w_soft, thd_neg, thd_pos) * scale
+                
+                # For LSTM, we approximate the reconstruction loss
+                # Since full LSTM forward is complex, we use MSE on weight space
+                recon_loss = F.mse_loss(w_quant, weight)
+                
+                # Regularization loss
+                reg_loss = self.regularization_loss(h_V, current_beta)
+                
+                # Total loss
+                loss = recon_loss + self.lambda_reg * reg_loss
+                
+                loss.backward()
+                optimizer.step()
+
+            if log_callback is not None:
+                log_callback(
+                    iteration,
+                    float(recon_loss.detach().cpu()),
+                    float(reg_loss.detach().cpu()),
+                    float(loss.detach().cpu()),
+                )
+            pbar.set_postfix(
+                loss=f"{float(loss.detach().cpu()):.4f}",
+                recon=f"{float(recon_loss.detach().cpu()):.4f}",
+                reg=f"{float(reg_loss.detach().cpu()):.4f}",
+            )
+            
+            # Anneal beta
+            current_beta = max(self.beta_end, current_beta / beta_decay)
+        
+        # Extract binary rounding
+        with torch.no_grad():
+            h_V_final = self.rectified_sigmoid(V)
+            rounding = (h_V_final > 0.5).float()
+        
+        return rounding
 
 
 class AdaRoundConv2d(nn.Module):
@@ -527,6 +611,132 @@ class AdaRoundEmbedding(nn.Module):
         self.weight_quant.is_calibrated = True
 
 
+class AdaRoundLSTM(nn.Module):
+    """LSTM with AdaRound PTQ"""
+    
+    def __init__(self, lstm: nn.LSTM, bit_width: int):
+        super().__init__()
+        self.lstm = lstm
+        
+        # Store LSTM attributes
+        self.input_size = lstm.input_size
+        self.hidden_size = lstm.hidden_size
+        self.num_layers = lstm.num_layers
+        self.bias = lstm.bias
+        self.batch_first = lstm.batch_first
+        self.dropout = lstm.dropout
+        self.bidirectional = lstm.bidirectional
+        
+        # Create quantizers for each layer's weights
+        self.weight_quantizers = nn.ModuleDict()
+        
+        num_directions = 2 if self.bidirectional else 1
+        
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                
+                # Quantizers for input-hidden and hidden-hidden weights
+                self.weight_quantizers[f"{prefix}_ih"] = AdaRoundQuantizer(bit_width=bit_width, per_channel=False)
+                self.weight_quantizers[f"{prefix}_hh"] = AdaRoundQuantizer(bit_width=bit_width, per_channel=False)
+                
+                # Initialize quantizers from actual weights
+                with torch.no_grad():
+                    weight_ih = getattr(lstm, f'weight_ih_l{layer}{suffix}')
+                    weight_hh = getattr(lstm, f'weight_hh_l{layer}{suffix}')
+                    self.weight_quantizers[f"{prefix}_ih"].init_scale_from_weights(weight_ih)
+                    self.weight_quantizers[f"{prefix}_hh"].init_scale_from_weights(weight_hh)
+        
+        # Store references to weights
+        self.weights = {}
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                self.weights[f"{prefix}_ih"] = getattr(lstm, f'weight_ih_l{layer}{suffix}')
+                self.weights[f"{prefix}_hh"] = getattr(lstm, f'weight_hh_l{layer}{suffix}')
+    
+    def forward(self, input, hx=None):
+        # Quantize all LSTM weights
+        num_directions = 2 if self.bidirectional else 1
+        
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                
+                # Get original weights
+                weight_ih = getattr(self.lstm, f'weight_ih_l{layer}{suffix}')
+                weight_hh = getattr(self.lstm, f'weight_hh_l{layer}{suffix}')
+                
+                # Quantize
+                q_weight_ih = self.weight_quantizers[f"{prefix}_ih"](weight_ih)
+                q_weight_hh = self.weight_quantizers[f"{prefix}_hh"](weight_hh)
+                
+                # Temporarily replace weights (for forward pass)
+                setattr(self.lstm, f'weight_ih_l{layer}{suffix}', nn.Parameter(q_weight_ih))
+                setattr(self.lstm, f'weight_hh_l{layer}{suffix}', nn.Parameter(q_weight_hh))
+        
+        # Forward through LSTM with quantized weights
+        output, hx = self.lstm(input, hx)
+        
+        # Restore original weights
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                weight_ih = self.weights[f"{prefix}_ih"]
+                weight_hh = self.weights[f"{prefix}_hh"]
+                setattr(self.lstm, f'weight_ih_l{layer}{suffix}', weight_ih)
+                setattr(self.lstm, f'weight_hh_l{layer}{suffix}', weight_hh)
+        
+        return output, hx
+    
+    def calibrate_rounding(
+        self,
+        input_activations: List[torch.Tensor],
+        target_outputs: List[torch.Tensor],
+        optimizer: 'AdaRoundOptimizer',
+        log_callback: Optional[Callable[[int, float, float, float], None]] = None,
+    ):
+        """Calibrate rounding for all LSTM weight matrices"""
+        num_directions = 2 if self.bidirectional else 1
+        
+        for layer in range(self.num_layers):
+            for direction in range(num_directions):
+                suffix = f"_reverse" if direction == 1 else ""
+                prefix = f"l{layer}{suffix}"
+                
+                # Optimize input-hidden weights
+                weight_ih = getattr(self.lstm, f'weight_ih_l{layer}{suffix}')
+                rounding_ih = optimizer.optimize_lstm_weight(
+                    weight=weight_ih,
+                    scale=self.weight_quantizers[f"{prefix}_ih"].s,
+                    thd_neg=self.weight_quantizers[f"{prefix}_ih"].thd_neg,
+                    thd_pos=self.weight_quantizers[f"{prefix}_ih"].thd_pos,
+                    input_activations=input_activations,
+                    target_outputs=target_outputs,
+                    log_callback=log_callback,
+                )
+                self.weight_quantizers[f"{prefix}_ih"].rounding = rounding_ih
+                self.weight_quantizers[f"{prefix}_ih"].is_calibrated = True
+                
+                # Optimize hidden-hidden weights
+                weight_hh = getattr(self.lstm, f'weight_hh_l{layer}{suffix}')
+                rounding_hh = optimizer.optimize_lstm_weight(
+                    weight=weight_hh,
+                    scale=self.weight_quantizers[f"{prefix}_hh"].s,
+                    thd_neg=self.weight_quantizers[f"{prefix}_hh"].thd_neg,
+                    thd_pos=self.weight_quantizers[f"{prefix}_hh"].thd_pos,
+                    input_activations=input_activations,
+                    target_outputs=target_outputs,
+                    log_callback=log_callback,
+                )
+                self.weight_quantizers[f"{prefix}_hh"].rounding = rounding_hh
+                self.weight_quantizers[f"{prefix}_hh"].is_calibrated = True
+
+
 class AdaRoundLayerNorm(nn.Module):
     """LayerNorm - kept in FP32"""
     
@@ -576,6 +786,11 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
                 
             elif isinstance(child, nn.Embedding):
                 new_layer = AdaRoundEmbedding(child, bit_width=self.bit_width)
+                setattr(module, name, new_layer)
+                self._layer_sequence.append((full_name, new_layer))
+                
+            elif isinstance(child, nn.LSTM):
+                new_layer = AdaRoundLSTM(child, bit_width=self.bit_width)
                 setattr(module, name, new_layer)
                 self._layer_sequence.append((full_name, new_layer))
                 
@@ -770,6 +985,13 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
                     target_outputs=layer_outputs,
                     optimizer=optimizer,
                     activation_fn=activation_fn,
+                    log_callback=log_callback,
+                )
+            elif isinstance(layer_module, AdaRoundLSTM):
+                layer_module.calibrate_rounding(
+                    input_activations=layer_inputs,
+                    target_outputs=layer_outputs,
+                    optimizer=optimizer,
                     log_callback=log_callback,
                 )
             elif isinstance(layer_module, AdaRoundEmbedding):

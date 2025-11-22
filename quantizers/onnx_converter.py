@@ -182,7 +182,7 @@ class QILONNXConverter(ONNXConverter):
     
     def prepare_model_for_export(self, model: nn.Module) -> nn.Module:
         """Convert QIL layers to standard layers with quantized weights"""
-        from quantizers.qil import QILConv2d, QILLinear, QILEmbedding, QILLayerNorm
+        from quantizers.qil import QILConv2d, QILLinear, QILEmbedding, QILLayerNorm, QILLSTM
         
         def convert_module(module):
             for name, child in list(module.named_children()):
@@ -235,6 +235,48 @@ class QILONNXConverter(ONNXConverter):
                         padding_idx=child.emb.padding_idx
                     )
                     new_layer.weight.data = q_weight
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, QILLSTM):
+                    with torch.no_grad():
+                        num_directions = 2 if child.bidirectional else 1
+                        
+                        # Create a new LSTM with the same parameters
+                        new_layer = nn.LSTM(
+                            input_size=child.input_size,
+                            hidden_size=child.hidden_size,
+                            num_layers=child.num_layers,
+                            bias=child.bias,
+                            batch_first=child.batch_first,
+                            dropout=child.dropout,
+                            bidirectional=child.bidirectional
+                        )
+                        
+                        # Copy quantized weights
+                        for layer in range(child.num_layers):
+                            for direction in range(num_directions):
+                                suffix = f"_reverse" if direction == 1 else ""
+                                prefix = f"l{layer}{suffix}"
+                                
+                                # Get and quantize weights
+                                weight_ih = getattr(child.lstm, f'weight_ih_l{layer}{suffix}')
+                                weight_hh = getattr(child.lstm, f'weight_hh_l{layer}{suffix}')
+                                
+                                q_weight_ih = child.weight_quantizers[f"{prefix}_ih"](weight_ih)
+                                q_weight_hh = child.weight_quantizers[f"{prefix}_hh"](weight_hh)
+                                
+                                # Set quantized weights
+                                getattr(new_layer, f'weight_ih_l{layer}{suffix}').data = q_weight_ih
+                                getattr(new_layer, f'weight_hh_l{layer}{suffix}').data = q_weight_hh
+                                
+                                if child.bias:
+                                    bias_ih = getattr(child.lstm, f'bias_ih_l{layer}{suffix}')
+                                    bias_hh = getattr(child.lstm, f'bias_hh_l{layer}{suffix}')
+                                    q_bias_ih = child.weight_quantizers[f"{prefix}_ih_bias"](bias_ih)
+                                    q_bias_hh = child.weight_quantizers[f"{prefix}_hh_bias"](bias_hh)
+                                    getattr(new_layer, f'bias_ih_l{layer}{suffix}').data = q_bias_ih
+                                    getattr(new_layer, f'bias_hh_l{layer}{suffix}').data = q_bias_hh
+                    
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, QILLayerNorm):
@@ -309,7 +351,7 @@ class AdaRoundONNXConverter(ONNXConverter):
     
     def prepare_model_for_export(self, model: nn.Module) -> nn.Module:
         """Convert AdaRound layers preserving quantization info"""
-        from quantizers.adaround import AdaRoundConv2d, AdaRoundLinear, AdaRoundEmbedding, AdaRoundLayerNorm
+        from quantizers.adaround import AdaRoundConv2d, AdaRoundLinear, AdaRoundEmbedding, AdaRoundLayerNorm, AdaRoundLSTM
         
         # Extract INT8 weights first
         int8_weights = self.export_adaround_weights_to_int8(model)
@@ -361,6 +403,47 @@ class AdaRoundONNXConverter(ONNXConverter):
                         padding_idx=child.emb.padding_idx
                     )
                     new_layer.weight.data = q_weight
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, AdaRoundLSTM):
+                    with torch.no_grad():
+                        num_directions = 2 if child.bidirectional else 1
+                        
+                        # Create a new LSTM with the same parameters
+                        new_layer = nn.LSTM(
+                            input_size=child.input_size,
+                            hidden_size=child.hidden_size,
+                            num_layers=child.num_layers,
+                            bias=child.bias,
+                            batch_first=child.batch_first,
+                            dropout=child.dropout,
+                            bidirectional=child.bidirectional
+                        )
+                        
+                        # Copy quantized weights
+                        for layer in range(child.num_layers):
+                            for direction in range(num_directions):
+                                suffix = f"_reverse" if direction == 1 else ""
+                                prefix = f"l{layer}{suffix}"
+                                
+                                # Get and quantize weights
+                                weight_ih = getattr(child.lstm, f'weight_ih_l{layer}{suffix}')
+                                weight_hh = getattr(child.lstm, f'weight_hh_l{layer}{suffix}')
+                                
+                                q_weight_ih = child.weight_quantizers[f"{prefix}_ih"].get_quantized_weight(weight_ih)
+                                q_weight_hh = child.weight_quantizers[f"{prefix}_hh"].get_quantized_weight(weight_hh)
+                                
+                                # Set quantized weights
+                                getattr(new_layer, f'weight_ih_l{layer}{suffix}').data = q_weight_ih
+                                getattr(new_layer, f'weight_hh_l{layer}{suffix}').data = q_weight_hh
+                                
+                                # Biases are not quantized in AdaRound typically
+                                if child.bias:
+                                    bias_ih = getattr(child.lstm, f'bias_ih_l{layer}{suffix}')
+                                    bias_hh = getattr(child.lstm, f'bias_hh_l{layer}{suffix}')
+                                    getattr(new_layer, f'bias_ih_l{layer}{suffix}').data = bias_ih
+                                    getattr(new_layer, f'bias_hh_l{layer}{suffix}').data = bias_hh
+                    
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, AdaRoundLayerNorm):
@@ -495,7 +578,7 @@ class LSQONNXConverter(ONNXConverter):
     
     def prepare_model_for_export(self, model: nn.Module) -> nn.Module:
         """Convert LSQ layers to standard layers with quantized weights"""
-        from quantizers.lsq import LSQConv2d, LSQLinear, LSQEmbedding, LSQLayerNorm
+        from quantizers.lsq import LSQConv2d, LSQLinear, LSQEmbedding, LSQLayerNorm, LSQLSTM
         
         def convert_module(module):
             for name, child in list(module.named_children()):
@@ -548,6 +631,48 @@ class LSQONNXConverter(ONNXConverter):
                         padding_idx=child.emb.padding_idx
                     )
                     new_layer.weight.data = q_weight
+                    setattr(module, name, new_layer)
+                    
+                elif isinstance(child, LSQLSTM):
+                    with torch.no_grad():
+                        num_directions = 2 if child.bidirectional else 1
+                        
+                        # Create a new LSTM with the same parameters
+                        new_layer = nn.LSTM(
+                            input_size=child.input_size,
+                            hidden_size=child.hidden_size,
+                            num_layers=child.num_layers,
+                            bias=child.bias,
+                            batch_first=child.batch_first,
+                            dropout=child.dropout,
+                            bidirectional=child.bidirectional
+                        )
+                        
+                        # Copy quantized weights
+                        for layer in range(child.num_layers):
+                            for direction in range(num_directions):
+                                suffix = f"_reverse" if direction == 1 else ""
+                                prefix = f"l{layer}{suffix}"
+                                
+                                # Get and quantize weights
+                                weight_ih = getattr(child.lstm, f'weight_ih_l{layer}{suffix}')
+                                weight_hh = getattr(child.lstm, f'weight_hh_l{layer}{suffix}')
+                                
+                                q_weight_ih = child.weight_quantizers[f"{prefix}_ih"](weight_ih)
+                                q_weight_hh = child.weight_quantizers[f"{prefix}_hh"](weight_hh)
+                                
+                                # Set quantized weights
+                                getattr(new_layer, f'weight_ih_l{layer}{suffix}').data = q_weight_ih
+                                getattr(new_layer, f'weight_hh_l{layer}{suffix}').data = q_weight_hh
+                                
+                                if child.bias:
+                                    bias_ih = getattr(child.lstm, f'bias_ih_l{layer}{suffix}')
+                                    bias_hh = getattr(child.lstm, f'bias_hh_l{layer}{suffix}')
+                                    q_bias_ih = child.weight_quantizers[f"{prefix}_ih_bias"](bias_ih)
+                                    q_bias_hh = child.weight_quantizers[f"{prefix}_hh_bias"](bias_hh)
+                                    getattr(new_layer, f'bias_ih_l{layer}{suffix}').data = q_bias_ih
+                                    getattr(new_layer, f'bias_hh_l{layer}{suffix}').data = q_bias_hh
+                    
                     setattr(module, name, new_layer)
                     
                 elif isinstance(child, LSQLayerNorm):
