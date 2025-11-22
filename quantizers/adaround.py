@@ -87,7 +87,7 @@ class AdaRoundOptimizer:
     
     def __init__(
         self,
-        num_iterations: int = 10000,
+        num_iterations: int = 1000,
         batch_size: int = 32,
         lr: float = 1e-3,
         lambda_reg: float = 0.01,
@@ -669,13 +669,14 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
         self,
         model: nn.Module,
         dataloader: torch.utils.data.DataLoader,
-        num_iterations: int = 10000,
+        num_iterations: int = 1000,
         batch_size: int = 32,
         lr: float = 1e-3,
         lambda_reg: float = 0.01,
         max_samples: int = 1024,
         device: str = 'cuda',
         batch_to_model_inputs: Optional[Callable[[Any, torch.device], Any]] = None,
+        metrics_eval_fn: Optional[Callable[[nn.Module], Dict[str, float]]] = None,
         mlflow_client=None,
     ) -> nn.Module:
         """Calibrate AdaRound layer-by-layer
@@ -691,8 +692,11 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
             lr=lr,
             lambda_reg=lambda_reg,
         )
-        
-        for idx, (layer_name, layer_module) in enumerate(self._layer_sequence):
+        layer_type_counters = {"linear": 0, "conv2d": 0, "embedding": 0, "other": 0}
+        best_per_layer_metrics: Dict[str, float] = {}
+
+        layer_pbar = tqdm(self._layer_sequence, desc="adaround_model_layers", leave=True)
+        for idx, (layer_name, layer_module) in enumerate(layer_pbar):
             layer_inputs, layer_outputs = self._collect_single_layer_io(
                 model=model,
                 layer_module=layer_module,
@@ -707,13 +711,42 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
             
             activation_fn = self._get_activation_fn(model, layer_name)
 
+            layer_pbar.set_postfix_str(layer_name)
+
             log_callback = None
             if mlflow_client is not None and getattr(self, "logging_backend", "none") == "mlflow":
-                def _log_cb(iter_idx: int, recon: float, reg: float, total: float, lname: str = layer_name):
+                if isinstance(layer_module, AdaRoundLinear):
+                    layer_type = "linear"
+                elif isinstance(layer_module, AdaRoundConv2d):
+                    layer_type = "conv2d"
+                elif isinstance(layer_module, AdaRoundEmbedding):
+                    layer_type = "embedding"
+                else:
+                    layer_type = "other"
+
+                layer_idx_by_type = layer_type_counters[layer_type]
+                layer_type_counters[layer_type] += 1
+                layer_id = str(layer_idx_by_type)
+                last_metrics = {"loss": None, "recon_loss": None, "reg_loss": None}
+
+                def _log_cb(
+                    iter_idx: int,
+                    recon: float,
+                    reg: float,
+                    total: float,
+                    lname: str = layer_name,
+                    ltype: str = layer_type,
+                    lid: str = layer_id,
+                    lm: dict = last_metrics,
+                ):
+                    lm["loss"] = total
+                    lm["recon_loss"] = recon
+                    lm["reg_loss"] = reg
+
                     metrics = {
-                        "adaround_loss": total,
-                        "adaround_recon_loss": recon,
-                        "adaround_reg_loss": reg,
+                        f"adaround_{ltype}-{lid}_loss": total,
+                        f"adaround_{ltype}-{lid}_recon_loss": recon,
+                        f"adaround_{ltype}-{lid}_reg_loss": reg,
                     }
                     step = int(iter_idx) + 1
                     for mk, mv in metrics.items():
@@ -731,7 +764,39 @@ class AdaRoundQuantizerWrapper(BaseQuantizerWrapper):
             elif isinstance(layer_module, AdaRoundEmbedding):
                 input_ids = [act.long() for act in layer_inputs]
                 layer_module.calibrate_rounding(input_ids, optimizer, log_callback=log_callback)
-            
+            if mlflow_client is not None and getattr(self, "logging_backend", "none") == "mlflow":
+                if "last_metrics" in locals() and last_metrics["loss"] is not None:
+                    for mk, mv in last_metrics.items():
+                        cur_val = float(mv)
+                        mlflow_client.log_metric(
+                            f"adaround_per-layer_{mk}", cur_val, step=idx + 1
+                        )
+                        prev_best = best_per_layer_metrics.get(mk, float("-inf"))
+                        if cur_val > prev_best:
+                            best_per_layer_metrics[mk] = cur_val
+                        mlflow_client.log_metric(
+                            f"max_adaround_per-layer_{mk}",
+                            best_per_layer_metrics[mk],
+                            step=idx + 1,
+                        )
+                if metrics_eval_fn is not None:
+                    try:
+                        metric_values = metrics_eval_fn(model)
+                    except Exception:
+                        metric_values = {}
+                    for mname, mval in metric_values.items():
+                        cur_val = float(mval)
+                        mlflow_client.log_metric(
+                            f"adaround_per-layer_{mname}", cur_val, step=idx + 1
+                        )
+                        prev_best = best_per_layer_metrics.get(mname, float("-inf"))
+                        if cur_val > prev_best:
+                            best_per_layer_metrics[mname] = cur_val
+                        mlflow_client.log_metric(
+                            f"max_adaround_per-layer_{mname}",
+                            best_per_layer_metrics[mname],
+                            step=idx + 1,
+                        )
         
         model.eval()
         return model

@@ -31,9 +31,8 @@ class BaseQuantizerWrapper(nn.Module, ABC):
     def prepare_ptq_model(self, model: nn.Module) -> nn.Module:
         return model
 
-    @abstractmethod
     def optimize_ptq(self, model: nn.Module, dataloader, device, **kwargs) -> nn.Module:
-        ...
+        return model
 
     def measure_model_size(self, model: nn.Module, bit_width: int = 32) -> int:
         total_params = 0

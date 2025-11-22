@@ -24,8 +24,5 @@ class NoQuantizerWrapper(BaseQuantizerWrapper):
     def __init__(self, quantizer: NoQuantizer, logging_backend: str = "none"):
         super().__init__(quantizer, logging_backend=logging_backend)
 
-    def optimize_ptq(self, model: torch.nn.Module, dataloader, device, **kwargs) -> torch.nn.Module:
-        return model
-
 
 
