@@ -1,5 +1,0 @@
-quantizer:
-  bit_width: [2, 4, 8, 16]
-  per_channel: True
-
-
