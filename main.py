@@ -269,6 +269,7 @@ def _evaluate_sampled_sasrec(
     metrics.update({f"NDCG_at_{k}": 0.0 for k in ks})
     mrr_total = 0.0
     n = 0
+    loss_sum = 0.0
     with torch.no_grad():
         batch_idx = 0
         for batch in tqdm(loader, desc="eval", leave=False):
@@ -285,6 +286,9 @@ def _evaluate_sampled_sasrec(
             cand = torch.cat([targets.unsqueeze(1), neg], dim=1)
             cand_emb = model.item_embedding(cand)
             scores = (cand_emb * preds.unsqueeze(1)).sum(-1)
+            probas = torch.softmax(scores, dim=-1)
+            loss_batch = -torch.log(probas[:, 0] + 1e-12).mean().item()
+            loss_sum += loss_batch * b
             topk_idx = scores.topk(max_k, dim=1).indices
             hit_matrix = topk_idx == 0
             hit_any = hit_matrix.any(dim=1)
@@ -308,11 +312,15 @@ def _evaluate_sampled_sasrec(
             if max_batches is not None and batch_idx >= int(max_batches):
                 break
     if n == 0:
-        return {f"HR_at_{k}": float("nan") for k in ks} | {
-            f"NDCG_at_{k}": float("nan") for k in ks
-        } | {f"MRR_at_{max(ks)}": float("nan")}
+        return {
+            **{f"HR_at_{k}": float("nan") for k in ks},
+            **{f"NDCG_at_{k}": float("nan") for k in ks},
+            f"MRR_at_{max(ks)}": float("nan"),
+            "loss": float("nan"),
+        }
     out: Dict[str, float] = {k: (metrics[k] / n) for k in metrics}
     out[f"MRR_at_{max(ks)}"] = mrr_total / n
+    out["loss"] = loss_sum / n
     return out
 
 
@@ -797,6 +805,11 @@ def main():
                                 max_batches=None,
                             )
 
+                        val_loss = (
+                            float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
+                        )
+                        log_payload["val_loss"] = val_loss
+
                         for metric_name, _ in sasrec_metrics_cfg:
                             train_val = float(train_rank_metrics.get(metric_name, float("nan")))
                             val_val = float(val_rank_metrics.get(metric_name, float("nan"))) if sequences_val else float(
@@ -870,6 +883,10 @@ def main():
                             batch_size=512,
                             max_batches=None,
                         )
+
+                    val_loss = (
+                        float(val_rank_metrics.get("loss", float("nan"))) if sequences_val else float("nan")
+                    )
 
                     for metric_name, _ in sasrec_metrics_cfg:
                         train_val = float(train_rank_metrics.get(metric_name, float("nan")))
