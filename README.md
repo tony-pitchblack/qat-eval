@@ -2,27 +2,28 @@
 
 ## Evaluation Results
 
-Table 1. 4-bit quantization metrics for different QAT methods, absolute values
+Evaluate on validation set after applying 8bit PTQ
 
-| Method    |   LSTM (ROCAUC)   | SASRec (NDCG@10) | ESPCN (PSNR)  |
-|-----------|:-----------------:|:----------------:|:-------------:|
-| No quant  |                   |                  |               |
-| LSQ       |                   |                  |               |
-| PACT      |                   |                  |               |
-| AdaRound  |                   |                  |               |
-| APoT      |                   |                  |               |
-| QIL       |                   |                  |               |
+Table 1. Absolute values
 
-Table 2. 4-bit quantization metrics for different QAT methods, values in % relative to no quantization
+| Method    |   LSTM (ROCAUC)   | SASRec (NDCG@10) |
+|-----------|:-----------------:|:----------------:|
+| No quant  | 0.9567            | 0.1962           |
+| LSQ       | 0.9546            | 0.1580           |
+| PACT      | -                 | 0.1928           |
+| AdaRound  | 0.9480            | 0.1942           |
+| APoT      | 0.9469            | 0.0086           |
+| QIL       | 0.9491            | 0.1152           |
 
-| Method    |   LSTM (ROCAUC)   | SASRec (NDCG@10) | ESPCN (PSNR)  |
-|-----------|:-----------------:|:----------------:|:-------------:|
-| No quant  |                   |                  |               |
-| LSQ       |                   |                  |               |
-| PACT      |                   |                  |               |
-| AdaRound  |                   |                  |               |
-| APoT      |                   |                  |               |
-| QIL       |                   |                  |               |
+Table 2. Delta % relative to no quantization
+
+| Method    |   LSTM (Δ vs No Quant, %) | SASRec (Δ vs No Quant, %) |
+|-----------|:------------------------:|:-------------------------:|
+| LSQ       | -0.2                     | -19.5                     |
+| PACT      | -                        | -1.7                      |
+| AdaRound  | -0.9                     | -1.0                      |
+| APoT      | -1.0                     | -95.6                     |
+| QIL       | -0.8                     | -41.3                     |
 
 *QIL = Quantization Interval Learning: https://arxiv.org/pdf/1808.05779*
 *No quant = No quantization applied*
